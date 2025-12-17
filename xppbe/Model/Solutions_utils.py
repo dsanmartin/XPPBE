@@ -27,7 +27,9 @@ class Solution_utils():
         elif function == 'G_Yukawa':
             phi_values = self.G_Yukawa(X)[:,0] - self.G(X)[:,0]
         elif function == 'analytic_Born_Ion':
-            phi_values = self.analytic_Born_Ion(np.linalg.norm(X, axis=1) ,*args,**kwargs)
+            # Convert to numpy if tensor
+            X_np = X.detach().cpu().numpy() if torch.is_tensor(X) else X
+            phi_values = self.analytic_Born_Ion(np.linalg.norm(X_np, axis=1) ,*args,**kwargs)
         elif function == 'PBJ':
             phi_values = self.pbj_solution(X, flag)
             if flag=='solvent':
@@ -45,7 +47,14 @@ class Solution_utils():
         @wraps(function)
         def wrapper(self,*kargs,**kwargs):
             ans = function(self,*kargs,**kwargs)
-            return ans*self.beta**-1
+            beta_inv = self.beta**-1
+            # Handle tensor/numpy compatibility
+            if torch.is_tensor(ans):
+                return ans * beta_inv
+            else:
+                # Convert beta to numpy scalar for numpy operations
+                beta_inv_np = beta_inv.detach().cpu().numpy() if torch.is_tensor(beta_inv) else beta_inv
+                return ans * beta_inv_np
         return wrapper
 
     @adim_function

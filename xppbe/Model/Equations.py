@@ -160,16 +160,14 @@ class PBE_Reg_2(PBE):
         else:
             X = torch.from_numpy(X).float().to(device)
         phi_q = self.get_phi(X,'molecule',model,'react')
-        phi_q = phi_q.cpu().numpy().reshape(-1)
+        phi_q = phi_q.detach().cpu().numpy().reshape(-1)
         G_solv = self.solvation_energy_phi_qs(phi_q)  
         return G_solv
-    
+
 
 class PBE_Var_Direct(PBE_Direct):
 
     def __init__(self,*args,**kwargs):
-        self.scheme = 'direct'
-        self.fields = ['phi','phi']
         super().__init__(*args,**kwargs)
 
         self.PDE_in = Variational_Poisson(self,self.domain_properties,field='phi')

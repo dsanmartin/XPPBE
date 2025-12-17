@@ -1,5 +1,5 @@
 import numpy as np
-import tensorflow as tf
+import torch
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -25,7 +25,8 @@ class Postprocessing():
 
         if not solution_utils:
             self.DTYPE='float32'
-            self.pi = tf.constant(np.pi, dtype=self.DTYPE)
+            self.device = PINN.device if hasattr(PINN, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.pi = torch.tensor(np.pi, dtype=torch.float32, device=self.device)
             self.save = save
             self.directory = directory
 
@@ -35,6 +36,8 @@ class Postprocessing():
             self.PDE = PINN.PDE
             self.PDE.pqr_path = self.mesh.path_pqr
             self.to_V = self.PDE.to_V
+            # Store numpy version for numpy operations
+            self.to_V_np = self.PDE.to_V.detach().cpu().numpy().item() if torch.is_tensor(self.PDE.to_V) else self.PDE.to_V
 
             self.loss_last = [np.format_float_scientific(self.PINN.losses['TL'][-1], unique=False, precision=3),
                             np.format_float_scientific(self.PINN.losses['TL1'][-1], unique=False, precision=3),
@@ -48,19 +51,33 @@ class Postprocessing():
                 os.makedirs(path, exist_ok=True)
 
     def get_phi(self,*args,**kwargs):
-        return self.PDE.get_phi(*args,**kwargs)*self.to_V
+        result = self.PDE.get_phi(*args,**kwargs)
+        # Multiply by to_V and convert PyTorch tensor to numpy array
+        if torch.is_tensor(result):
+            return (result * self.to_V).detach().cpu().numpy()
+        return result * self.to_V_np
 
     def get_dphi(self,*args,**kwargs):
-        return tuple(dphi*self.to_V for dphi in self.PDE.get_dphi(*args,**kwargs))
+        dphi_tuple = self.PDE.get_dphi(*args,**kwargs)
+        # Multiply by to_V and convert PyTorch tensors to numpy arrays
+        return tuple((dphi * self.to_V).detach().cpu().numpy() if torch.is_tensor(dphi) else dphi * self.to_V_np for dphi in dphi_tuple)
 
     def phi_known(self,*args,**kwargs):
-        return self.PDE.phi_known(*args,**kwargs)*self.to_V
+        result = self.PDE.phi_known(*args,**kwargs)
+        # Multiply by to_V and convert PyTorch tensor to numpy array
+        if torch.is_tensor(result):
+            return (result * self.to_V).detach().cpu().numpy()
+        return result * self.to_V_np
 
     def get_phi_interface_verts(self,*args,**kwargs):
-        return tuple(phi*self.to_V for phi in self.PDE.get_phi_interface_verts(*args,**kwargs))
+        phi_tuple = self.PDE.get_phi_interface_verts(*args,**kwargs)
+        # Multiply by to_V and convert PyTorch tensors to numpy arrays
+        return tuple((phi * self.to_V).detach().cpu().numpy() if torch.is_tensor(phi) else phi * self.to_V_np for phi in phi_tuple)
 
     def get_dphi_interface_verts(self,*args,**kwargs):
-        return tuple(dphi*self.to_V for dphi in self.PDE.get_dphi_interface_verts(*args,**kwargs))
+        dphi_tuple = self.PDE.get_dphi_interface_verts(*args,**kwargs)
+        # Multiply by to_V and convert PyTorch tensors to numpy arrays
+        return tuple((dphi * self.to_V).detach().cpu().numpy() if torch.is_tensor(dphi) else dphi * self.to_V_np for dphi in dphi_tuple)
 
     def get_solvation_energy(self,*args,**kwargs):
         return self.PDE.get_solvation_energy(self.model)
@@ -284,8 +301,12 @@ class Postprocessing():
         fig,ax = plt.subplots()
         ax.plot(np.array(list(self.PINN.G_solv_hist.keys()), dtype=self.DTYPE), self.PINN.G_solv_hist.values(),'k-',label='PINN')
         if not known_method is None:
-            G_known = self.PDE.solvation_energy_phi_qs(self.to_V**-1*self.phi_known(known_method,'react',tf.constant(self.PDE.x_qs, dtype=self.DTYPE),'molecule'))
-            G_known = np.ones(len(self.PINN.G_solv_hist))*G_known
+            # Convert x_qs to tensor properly
+            x_qs_tensor = torch.from_numpy(self.PDE.x_qs).float().to(self.device) if isinstance(self.PDE.x_qs, np.ndarray) else self.PDE.x_qs.clone().detach().to(self.device)
+            G_known = self.PDE.solvation_energy_phi_qs(self.to_V**-1*self.phi_known(known_method,'react',x_qs_tensor,'molecule'))
+            # Convert G_known to numpy scalar if it's a tensor
+            G_known_scalar = G_known.detach().cpu().numpy() if torch.is_tensor(G_known) else G_known
+            G_known = np.ones(len(self.PINN.G_solv_hist))*G_known_scalar
             label = known_method.replace('_',' ')
             if label=='PBJ':
                 label='BEM'
@@ -317,8 +338,8 @@ class Postprocessing():
         
         X_in,X_out,r_in,r_out = self.get_points_line(N,x0,theta,phi)
         
-        u_in = self.get_phi(tf.constant(X_in, dtype=self.DTYPE),'molecule',self.model,  value)[:,0]
-        u_out = self.get_phi(tf.constant(X_out, dtype=self.DTYPE),'solvent',self.model,  value)[:,0]
+        u_in = self.get_phi(torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule',self.model,  value)[:,0]
+        u_out = self.get_phi(torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent',self.model,  value)[:,0]
 
         ax.plot(r_in,u_in[:], label='Solute', c='r')
         ax.plot(r_out[r_out<0],u_out[r_out<0], label='Solvent', c='b')
@@ -350,11 +371,11 @@ class Postprocessing():
         
         X_in,X_out,r_in,r_out = self.get_points_line(N,x0,theta,phi)
         
-        u_in = self.get_phi(tf.constant(X_in, dtype=self.DTYPE),'molecule',self.model,  value)[:,0]
-        u_out = self.get_phi(tf.constant(X_out, dtype=self.DTYPE),'solvent',self.model,  value)[:,0]
+        u_in = self.get_phi(torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule',self.model,  value)[:,0]
+        u_out = self.get_phi(torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent',self.model,  value)[:,0]
 
-        u_in_an = self.phi_known(method,value,tf.constant(X_in, dtype=self.DTYPE),'molecule',self.mesh.R_max_dist)
-        u_out_an = self.phi_known(method,value,tf.constant(X_out, dtype=self.DTYPE),'solvent',self.mesh.R_max_dist)
+        u_in_an = self.phi_known(method,value,torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule',self.mesh.R_max_dist)
+        u_out_an = self.phi_known(method,value,torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent',self.mesh.R_max_dist)
 
         ax.plot(r_in,u_in[:], c='b')
         ax.plot(r_out[r_out<0],u_out[r_out<0], label='PINN', c='b')
@@ -426,8 +447,8 @@ class Postprocessing():
         X_in,X_out,bools,vectors = self.get_points_plane(N, x0, n)
         T,S = vectors
 
-        u_in = self.get_phi(tf.constant(X_in, dtype=self.DTYPE),'molecule',self.model, value)[:,0]
-        u_out = self.get_phi(tf.constant(X_out, dtype=self.DTYPE),'solvent',self.model, value)[:,0]
+        u_in = self.get_phi(torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule',self.model, value)[:,0]
+        u_out = self.get_phi(torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent',self.model, value)[:,0]
 
         vmax,vmin = self.get_max_min(u_in,u_out)
         s = ax.scatter(T.ravel()[bools[0]], S.ravel()[bools[0]], c=u_in[:],vmin=vmin,vmax=vmax)
@@ -460,8 +481,8 @@ class Postprocessing():
         X_in, X_out, bools, vectors = self.get_points_plane(N, x0, n)
         T, S = vectors
 
-        XX_in = self.mesh.get_X(tf.constant(X_in, dtype=self.DTYPE))
-        XX_out = self.mesh.get_X(tf.constant(X_out, dtype=self.DTYPE))
+        XX_in = self.mesh.get_X(torch.tensor(X_in, dtype=torch.float32, device=self.device))
+        XX_out = self.mesh.get_X(torch.tensor(X_out, dtype=torch.float32, device=self.device))
 
         u_in = self.PDE.PDE_in.get_r(self.mesh, self.model, XX_in, '', 'molecule')
         u_out = self.PDE.PDE_in.get_r(self.mesh, self.model, XX_out, '', 'solvent')
@@ -504,11 +525,11 @@ class Postprocessing():
             text_l = r'dphi' if value == 'phi' else '∂𝜓'
 
         if domain =='interface':
-            values = values.numpy().flatten()
+            values = values.flatten() if isinstance(values, np.ndarray) else values.detach().cpu().numpy().flatten()
         elif domain =='molecule':
-            values = values_1.numpy().flatten()
+            values = values_1.flatten() if isinstance(values_1, np.ndarray) else values_1.detach().cpu().numpy().flatten()
         elif domain =='solvent':
-            values = values_2.numpy().flatten()
+            values = values_2.flatten() if isinstance(values_2, np.ndarray) else values_2.detach().cpu().numpy().flatten()
 
         fig = self.plot_interface_3D_known_by(values, vertices, elements, cmin=cmin, cmax=cmax, jupyter=False)
 
@@ -614,18 +635,26 @@ class Postprocessing():
         vertices = self.mesh.mol_verts.astype(np.float32)
         elements = self.mesh.mol_faces.astype(np.float32)
 
-        phi_known = self.phi_known(method,'react', vertices, flag='solvent')
-        phi_pinn = self.get_phi(vertices,flag='interface',model=self.model,value='react')
+        # Convert vertices to tensor for model input
+        vertices_tensor = torch.from_numpy(vertices).float().to(self.device)
+        
+        phi_known = self.phi_known(method,'react', vertices_tensor, flag='solvent')
+        phi_pinn = self.get_phi(vertices_tensor,flag='interface',model=self.model,value='react')
 
         if method == 'PBJ':
             vertices = self.PDE.pbj_vertices.astype(np.float32)
             elements = self.PDE.pbj_elements.astype(np.float32)
-            phi_known = self.phi_known(method,'react', vertices, flag='solvent')
-            phi_pinn = self.get_phi(vertices,flag='molecule',model=self.model,value='react')
+            vertices_tensor = torch.from_numpy(vertices).float().to(self.device)
+            phi_known = self.phi_known(method,'react', vertices_tensor, flag='solvent')
+            phi_pinn = self.get_phi(vertices_tensor,flag='molecule',model=self.model,value='react')
 
-        error = np.abs(phi_pinn.numpy().reshape(-1,1) - phi_known.numpy().reshape(-1,1))
+        # Convert to numpy if needed
+        phi_pinn_np = phi_pinn if isinstance(phi_pinn, np.ndarray) else phi_pinn.detach().cpu().numpy()
+        phi_known_np = phi_known if isinstance(phi_known, np.ndarray) else phi_known.detach().cpu().numpy()
+        
+        error = np.abs(phi_pinn_np.reshape(-1,1) - phi_known_np.reshape(-1,1))
         if type_e == 'relative':
-            error /= phi_known.numpy().reshape(-1,1)
+            error /= phi_known_np.reshape(-1,1)
 
 
         fig = self.plot_interface_error_by(error,vertices,elements,scale,jupyter=jupyter,cmin=cmin,cmax=cmax)
@@ -1099,9 +1128,9 @@ class Postprocessing():
 
     @staticmethod
     def get_max_min(u1,u2):
-        U = tf.concat([u1,u2], axis=0)
-        vmax = tf.reduce_max(U)
-        vmin = tf.reduce_min(U)
+        U = np.concatenate([u1,u2], axis=0)
+        vmax = np.max(U)
+        vmin = np.min(U)
         return vmax,vmin
 
     def get_points_line(self,N,x0,theta,phi):
@@ -1165,8 +1194,12 @@ class Postprocessing():
             phi_known = self.phi_known(known_method,'react', vertices, flag='solvent')
             phi_pinn = self.get_phi(vertices,flag='interface',model=self.model,value='react')
 
-        phi_dif = (phi_pinn.numpy().reshape(-1,1) - phi_known.numpy().reshape(-1,1))
-        error = np.sqrt(np.sum(phi_dif**2)/np.sum(phi_known.numpy().reshape(-1,1)**2))
+        # Convert to numpy if needed
+        phi_pinn_np = phi_pinn if isinstance(phi_pinn, np.ndarray) else phi_pinn.detach().cpu().numpy()
+        phi_known_np = phi_known if isinstance(phi_known, np.ndarray) else phi_known.detach().cpu().numpy()
+        
+        phi_dif = (phi_pinn_np.reshape(-1,1) - phi_known_np.reshape(-1,1))
+        error = np.sqrt(np.sum(phi_dif**2)/np.sum(phi_known_np.reshape(-1,1)**2))
         return error
 
     def Error_Gsolv_known(self,known_method):
@@ -1249,12 +1282,31 @@ class Postprocessing():
     def save_model_summary(self):
         path_save = os.path.join(self.directory,self.path_plots_model,'models_summary.txt')
         with open(path_save, 'w') as f:
-            print_func = lambda x: print(x, file=f)
-            self.PINN.model.summary(print_fn=print_func)
-            print("\n\n", file=f)
-            self.PINN.model.NNs[0].summary(print_fn=print_func)
-            print("\n\n", file=f) 
-            self.PINN.model.NNs[1].summary(print_fn=print_func)
+            # PyTorch model summary
+            print("="*80, file=f)
+            print("FULL MODEL", file=f)
+            print("="*80, file=f)
+            print(self.PINN.model, file=f)
+            
+            # Count parameters
+            total_params = sum(p.numel() for p in self.PINN.model.parameters())
+            trainable_params = sum(p.numel() for p in self.PINN.model.parameters() if p.requires_grad)
+            print(f"\nTotal parameters: {total_params:,}", file=f)
+            print(f"Trainable parameters: {trainable_params:,}", file=f)
+            
+            print("\n\n" + "="*80, file=f)
+            print("MOLECULE NEURAL NETWORK", file=f)
+            print("="*80, file=f)
+            print(self.PINN.model.NNs[0], file=f)
+            nn0_params = sum(p.numel() for p in self.PINN.model.NNs[0].parameters())
+            print(f"\nParameters: {nn0_params:,}", file=f)
+            
+            print("\n\n" + "="*80, file=f)
+            print("SOLVENT NEURAL NETWORK", file=f)
+            print("="*80, file=f)
+            print(self.PINN.model.NNs[1], file=f)
+            nn1_params = sum(p.numel() for p in self.PINN.model.NNs[1].parameters())
+            print(f"\nParameters: {nn1_params:,}", file=f)
         
         path_save = os.path.join(self.directory,self.path_plots_model,'hyperparameters.json')
         with open(path_save, "w") as json_file:
@@ -1262,21 +1314,28 @@ class Postprocessing():
 
     def plot_architecture(self,domain=1):
         
-        domain -= 1
-        input_layer = tf.keras.layers.Input(shape=self.PINN.model.NNs[domain].input_shape_N[1:], name='input')
-        visual_model = tf.keras.models.Model(inputs=input_layer, outputs=self.PINN.model.NNs[domain].call(input_layer))
+        # Note: This function was designed for TensorFlow/Keras models
+        # For PyTorch models, consider using torchviz or similar tools
+        print("Warning: plot_architecture is not yet implemented for PyTorch models")
+        print("Consider using torchviz or similar tools for PyTorch model visualization")
+        return
+        
+        # Original TensorFlow code commented out:
+        # domain -= 1
+        # input_layer = tf.keras.layers.Input(shape=self.PINN.model.NNs[domain].input_shape_N[1:], name='input')
+        # visual_model = tf.keras.models.Model(inputs=input_layer, outputs=self.PINN.model.NNs[domain].call(input_layer))
 
-        if self.save:
-            path = f'model_architecture_{domain+1}.png'
-            path_save = os.path.join(self.directory,self.path_plots_model,path)
+        # if self.save:
+        #     path = f'model_architecture_{domain+1}.png'
+        #     path_save = os.path.join(self.directory,self.path_plots_model,path)
 
-            tf.keras.utils.plot_model(visual_model, to_file=path_save,
-                                        show_shapes=True,
-                                        show_dtype=False,
-                                        show_layer_names=True,
-                                        expand_nested=True,
-                                        show_layer_activations=True,
-                                        dpi = 150)
+        #     tf.keras.utils.plot_model(visual_model, to_file=path_save,
+        #                                 show_shapes=True,
+        #                                 show_dtype=False,
+        #                                 show_layer_names=True,
+        #                                 expand_nested=True,
+        #                                 show_layer_activations=True,
+        #                                 dpi = 150)
 
 
 
@@ -1291,15 +1350,15 @@ class Born_Ion_Postprocessing(Postprocessing):
         
         X_in,X_out,r_in,r_out = self.get_points_line(N,x0,theta,phi)
         
-        u_in = self.get_phi(tf.constant(X_in, dtype=self.DTYPE),'molecule',self.model, value)[:,0]
-        u_out = self.get_phi(tf.constant(X_out, dtype=self.DTYPE),'solvent',self.model, value)[:,0]
+        u_in = self.get_phi(torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule',self.model, value)[:,0]
+        u_out = self.get_phi(torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent',self.model, value)[:,0]
 
         ax.plot(r_in,u_in[:], c='b')
         ax.plot(r_out[r_out<0],u_out[r_out<0], label='PINN', c='b')
         ax.plot(r_out[r_out>0],u_out[r_out>0], c='b')
 
-        u_in_an = self.phi_known('analytic_Born_Ion',value,tf.constant(X_in, dtype=self.DTYPE),'molecule')
-        u_out_an = self.phi_known('analytic_Born_Ion',value,tf.constant(X_out, dtype=self.DTYPE),'solvent')
+        u_in_an = self.phi_known('analytic_Born_Ion',value,torch.tensor(X_in, dtype=torch.float32, device=self.device),'molecule')
+        u_out_an = self.phi_known('analytic_Born_Ion',value,torch.tensor(X_out, dtype=torch.float32, device=self.device),'solvent')
 
         ax.plot(r_in[np.abs(r_in) > 0.05],u_in_an[np.abs(r_in) > 0.05], c='r', linestyle='--')
         ax.plot(r_out[r_out<0],u_out_an[r_out<0], label='Analytic', c='r', linestyle='--')
@@ -1307,7 +1366,7 @@ class Born_Ion_Postprocessing(Postprocessing):
 
         if zoom:
             R = self.PINN.mesh.R_mol
-            v = self.phi_known('analytic_Born_Ion',value,tf.constant([[R,0,0]], dtype=self.DTYPE),'solvent')
+            v = self.phi_known('analytic_Born_Ion',value,torch.tensor([[R,0,0]], dtype=torch.float32, device=self.device),'solvent')
 
             if value == 'phi':
                 axin = ax.inset_axes([0.65, 0.25, 0.28, 0.34])
@@ -1363,45 +1422,48 @@ class Born_Ion_Postprocessing(Postprocessing):
 
         rr = self.PINN.mesh.R_mol
         uu,vv = self.normal_vector_n(nn)
-        theta_bl = np.linspace(0, 2*np.pi, N, dtype=self.DTYPE)
+        theta_bl_np = np.linspace(0, 2*np.pi, N, dtype=self.DTYPE)
         X = np.zeros((N,3))
         for i in range(N):
-            X[i,:] = rr*np.cos(theta_bl[i])*uu + rr*np.sin(theta_bl[i])*vv
+            X[i,:] = rr*np.cos(theta_bl_np[i])*uu + rr*np.sin(theta_bl_np[i])*vv
         
-        theta_bl = tf.constant(theta_bl.reshape(-1,1))
-        XX_bl = tf.constant(X, dtype=self.DTYPE)
+        theta_bl = torch.tensor(theta_bl_np.reshape(-1,1), dtype=torch.float32, device=self.device)
+        XX_bl = torch.tensor(X, dtype=torch.float32, device=self.device)
 
         fig, ax = plt.subplots() 
 
         for i,flag in zip([0,1],['molecule','solvent']):
             if plot=='u':
                 U = self.get_phi(XX_bl,flag,self.model,value)[:,0]
-                ax.plot(theta_bl[:,0],U[:], label=labels[i], c=colr[i])
+                ax.plot(theta_bl_np,U[:], label=labels[i], c=colr[i])
             elif plot=='du':
                 radial_vector = XX_bl
-                magnitude = tf.norm(radial_vector, axis=1, keepdims=True)
+                magnitude = torch.norm(radial_vector, dim=1, keepdim=True)
                 normal_vector = radial_vector / magnitude
                 du = self.get_dphi(XX_bl,normal_vector,flag,self.model,value)
                 if i==0:
-                    ax.plot(theta_bl[:,0],du[i][:,0]*self.PDE.epsilon_1, label=labels[i], c=colr[i])
+                    ax.plot(theta_bl_np,du[i][:,0]*self.PDE.epsilon_1, label=labels[i], c=colr[i])
                 else:
-                    ax.plot(theta_bl[:,0],du[i][:,0]*self.PDE.epsilon_2, label=labels[i], c=colr[i])
+                    ax.plot(theta_bl_np,du[i][:,0]*self.PDE.epsilon_2, label=labels[i], c=colr[i])
             i += 1
 
         if plot=='u':
-            U2 = self.phi_known('analytic_Born_Ion',value,tf.constant([[rr,0,0]], dtype=self.DTYPE),'')
+            U2 = self.phi_known('analytic_Born_Ion',value,torch.tensor([[rr,0,0]], dtype=torch.float32, device=self.device),'')
             u2 = np.ones((N,1))*U2
-            ax.plot(theta_bl, u2, c='g', label='Analytic', linestyle='--')
+            ax.plot(theta_bl_np, u2, c='g', label='Analytic', linestyle='--')
 
         elif plot=='du':
             dU2 = self.PINN.PDE.analytic_Born_Ion_du(rr)*self.to_V
             du2 = np.ones((N,1))*dU2*self.PDE.epsilon_1
             if value=='react':
                 n = du2.shape[0]
-                nnvv = tf.concat([tf.ones((n, 1)), tf.zeros((n, 2))], axis=1)
-                XX2 = tf.concat([tf.ones((n,1))*rr, tf.zeros((n, 2))], axis=1)
-                du2 -= self.PINN.PDE.dG_n(*self.mesh.get_X(XX2),nnvv)*self.to_V
-            ax.plot(theta_bl, du2, c='g', label='Analytic', linestyle='--')
+                nnvv = torch.cat([torch.ones((n, 1), device=self.device), torch.zeros((n, 2), device=self.device)], dim=1)
+                XX2 = torch.cat([torch.ones((n,1), device=self.device)*rr, torch.zeros((n, 2), device=self.device)], dim=1)
+                du2_correction = self.PINN.PDE.dG_n(*self.mesh.get_X(XX2),nnvv)*self.to_V
+                if torch.is_tensor(du2_correction):
+                    du2_correction = du2_correction.detach().cpu().numpy()
+                du2 -= du2_correction
+            ax.plot(theta_bl_np, du2, c='g', label='Analytic', linestyle='--')
         
         if plot=='u':
             unit = 'V'

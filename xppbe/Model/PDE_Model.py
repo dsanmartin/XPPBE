@@ -98,11 +98,17 @@ class PBE(Solution_utils):
 
     def get_phi_interface_verts(self,model,**kwargs):      
         verts = torch.from_numpy(self.mesh.mol_verts).to(torch.float32 if self.DTYPE == 'float32' else torch.float64)
+        # Move to same device as model
+        device = next(model.parameters()).device
+        verts = verts.to(device)
         return self.get_phi_interface(verts,model,**kwargs)
     
     def get_dphi_interface_verts(self,model,value='phi'): 
-        verts = torch.from_numpy(self.mesh.mol_verts).to(torch.float32 if self.DTYPE == 'float32' else torch.float64)     
-        N_v = self.mesh.mol_verts_normal
+        verts = torch.from_numpy(self.mesh.mol_verts).to(torch.float32 if self.DTYPE == 'float32' else torch.float64)
+        # Move to same device as model
+        device = next(model.parameters()).device
+        verts = verts.to(device)     
+        N_v = torch.from_numpy(self.mesh.mol_verts_normal).to(torch.float32 if self.DTYPE == 'float32' else torch.float64).to(device)
         return self.get_dphi_interface(verts,N_v,model)
     
     
@@ -367,12 +373,15 @@ class PBE(Solution_utils):
         for idx in range(num_charges):
             valid_indices = torch.where(mask[idx])[0]
             diff_positions = positions_diff[idx][mask[idx]]
-            phi_contribs = torch.stack([
-                self.charges_Born_Ion(diff_positions[j].item(), R=diff_positions[j].item(), q=self.qs[valid_indices[j].item()])
-                for j in range(len(valid_indices))
-            ])
-            phi_contribs_all.append(torch.sum(phi_contribs))
-        phi_contribs_all = torch.tensor(phi_contribs_all, dtype=self.dtype)
+            if len(valid_indices) > 0:
+                phi_contribs = torch.stack([
+                    self.charges_Born_Ion(diff_positions[j].item(), R=diff_positions[j].item(), q=self.qs[valid_indices[j].item()])
+                    for j in range(len(valid_indices))
+                ])
+                phi_contribs_all.append(torch.sum(phi_contribs))
+            else:
+                phi_contribs_all.append(torch.tensor(0.0, dtype=self.dtype))
+        phi_contribs_all = torch.stack(phi_contribs_all)
 
         phi_total_all = phi_born_all + phi_contribs_all
 

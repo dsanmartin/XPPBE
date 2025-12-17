@@ -99,8 +99,8 @@ options_optimizer2:
     gtol: 0.00000000001
     
 # Solve parameters
-N_iters: 1000
-N_steps_2: 100
+N_iters: 100
+N_steps_2: 10
 
 
 iters_save_model: 0

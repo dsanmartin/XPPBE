@@ -4,7 +4,7 @@ import os
 from xppbe import Simulation
 
 yaml_path = 'path_to_input_file.yaml'   # example 'input_files/BI/BI_WA_TF_FF_SI_SO.yaml'
-yaml_path = 'input_files/BI/BI_WA_TF_FF_SI_SO.yaml'
+yaml_path = 'input_files/BI/BI_WA_TF_FF_SI_SO_test.yaml'
 
 molecule_dir = None                     # Use default molecule directory if None, calling xppbe/Molecules/
 
