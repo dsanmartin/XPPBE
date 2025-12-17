@@ -1,6 +1,6 @@
 import os
 import numpy as np
-import tensorflow as tf
+import torch
 
 from xppbe.Mesh.Charges_utils import get_charges_list
 from .Solutions_utils import Solution_utils
@@ -8,15 +8,16 @@ from .Solutions_utils import Solution_utils
 class PBE(Solution_utils):
 
     DTYPE = 'float32'
+    dtype = torch.float32
 
-    qe = tf.constant(1.60217663e-19, dtype=DTYPE)
-    eps0 = tf.constant(8.8541878128e-12, dtype=DTYPE)     
-    kb = tf.constant(1.380649e-23, dtype=DTYPE)              
-    Na = tf.constant(6.02214076e23, dtype=DTYPE)
-    ang_to_m = tf.constant(1e-10, dtype=DTYPE)
-    cal2j = tf.constant(4.184, dtype=DTYPE)
+    qe = torch.tensor(1.60217663e-19, dtype=dtype)
+    eps0 = torch.tensor(8.8541878128e-12, dtype=dtype)     
+    kb = torch.tensor(1.380649e-23, dtype=dtype)              
+    Na = torch.tensor(6.02214076e23, dtype=dtype)
+    ang_to_m = torch.tensor(1e-10, dtype=dtype)
+    cal2j = torch.tensor(4.184, dtype=dtype)
 
-    pi = tf.constant(np.pi, dtype=DTYPE)
+    pi = torch.tensor(np.pi, dtype=dtype)
 
     def __init__(self, domain_properties, mesh, equation, pinns_method, adim, main_path, molecule_dir, results_path):      
 
@@ -73,7 +74,12 @@ class PBE(Solution_utils):
             if key in domain_properties:
                 self.domain_properties[key] = domain_properties[key]
             if key != 'molecule':
-                setattr(self, key, tf.constant(self.domain_properties[key], dtype=self.DTYPE))
+                torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+                value = self.domain_properties[key]
+                if torch.is_tensor(value):
+                    setattr(self, key, value.clone().detach().to(torch_dtype))
+                else:
+                    setattr(self, key, torch.tensor(value, dtype=torch_dtype))
             else:
                 setattr(self, key, self.domain_properties[key])
 
@@ -91,11 +97,11 @@ class PBE(Solution_utils):
         return du_prom,du_1,du_2
 
     def get_phi_interface_verts(self,model,**kwargs):      
-        verts = tf.constant(self.mesh.mol_verts, dtype=self.DTYPE)
+        verts = torch.from_numpy(self.mesh.mol_verts).to(torch.float32 if self.DTYPE == 'float32' else torch.float64)
         return self.get_phi_interface(verts,model,**kwargs)
     
     def get_dphi_interface_verts(self,model,value='phi'): 
-        verts = tf.constant(self.mesh.mol_verts, dtype=self.DTYPE)     
+        verts = torch.from_numpy(self.mesh.mol_verts).to(torch.float32 if self.DTYPE == 'float32' else torch.float64)     
         N_v = self.mesh.mol_verts_normal
         return self.get_dphi_interface(verts,N_v,model)
     
@@ -110,35 +116,44 @@ class PBE(Solution_utils):
             if method=='exponential':
                 if pinn: 
                     phi = self.get_phi(X_solv,flag, model)
-                else: 
-                    phi = self.phi_known(known_method,'phi',tf.constant(X_solv),'solvent').reshape(-1,1)
-                r_H = tf.math.sqrt(tf.reduce_sum(tf.square(x_q - X_solv), axis=1, keepdims=True))
-                G2_p = tf.math.reduce_sum(self.aprox_exp(-phi/self.gamma)/r_H**6)
-                G2_m = tf.math.reduce_sum(self.aprox_exp(phi/self.gamma)/r_H**6)
-                phi_ens_pred = - self.gamma/2 * tf.math.log(G2_p/G2_m)
+                else:
+                    X_solv_torch = torch.from_numpy(X_solv).float() if isinstance(X_solv, np.ndarray) else X_solv
+                    phi = self.phi_known(known_method,'phi',X_solv_torch,'solvent').reshape(-1,1)
+                r_H = torch.sqrt(torch.sum((x_q - X_solv)**2, dim=1, keepdim=True))
+                G2_p = torch.sum(self.aprox_exp(-phi/self.gamma)/r_H**6)
+                G2_m = torch.sum(self.aprox_exp(phi/self.gamma)/r_H**6)
+                phi_ens_pred = - self.gamma/2 * torch.log(G2_p/G2_m)
             
             elif method=='mean':
-                r_H = tf.math.sqrt(tf.reduce_sum(tf.square(x_q - X_solv), axis=1))
-                X_ens = tf.boolean_mask(X_solv, r_H < (r_q + self.mesh.dR_exterior))
+                r_H = torch.sqrt(torch.sum((x_q - X_solv)**2, dim=1))
+                mask = r_H < (r_q + self.mesh.dR_exterior)
+                X_ens = X_solv[mask]
                 if pinn: 
                     phi = self.get_phi(X_ens,flag, model)
-                else: 
-                    phi = self.phi_known(known_method,'phi',tf.constant(X_ens),'solvent').reshape(-1,1)
-                phi_ens_pred = tf.reduce_mean(phi)
+                else:
+                    X_ens_torch = torch.from_numpy(X_ens).float() if isinstance(X_ens, np.ndarray) else X_ens
+                    phi = self.phi_known(known_method,'phi',X_ens_torch,'solvent').reshape(-1,1)
+                phi_ens_pred = torch.mean(phi)
 
             phi_ens_L.append(phi_ens_pred)
 
         return phi_ens_L    
     
     def solvation_energy_phi_qs(self,phi_q):
-        G_solv = 0.5*tf.reduce_sum(self.qs * phi_q)
+        # Convert to torch if needed
+        if isinstance(phi_q, np.ndarray):
+            phi_q = torch.from_numpy(phi_q).float()
+        qs = torch.from_numpy(self.qs).float() if isinstance(self.qs, np.ndarray) else self.qs
+        G_solv = 0.5*torch.sum(qs * phi_q)
         G_solv *= self.to_V*self.qe*self.Na*(10**-3/self.cal2j)   
         return G_solv
 
     # Losses
 
     def get_loss(self, X_batches, model, validation=False):
-        L = self.create_L()
+        # Get device from model parameters
+        device = next(model.parameters()).device
+        L = self.create_L(device=device)
 
         #residual
         if 'R1' in X_batches: 
@@ -203,7 +218,7 @@ class PBE(Solution_utils):
     def dirichlet_loss(self,mesh,model,XD,UD,flag):
         Loss_d = 0
         u_pred = self.get_phi(XD,flag,model)
-        loss = tf.reduce_mean(tf.square(UD - u_pred)) 
+        loss = torch.mean((UD - u_pred)**2)
         Loss_d += loss
         return Loss_d
 
@@ -216,29 +231,29 @@ class PBE(Solution_utils):
         if loss_type=='Iu':
             u1 = self.get_phi(XI,'molecule',model)
             u2 = self.get_phi(XI,'solvent',model)
-            loss += tf.reduce_mean(tf.square(u1-u2)) 
+            loss += torch.mean((u1-u2)**2)
 
         elif loss_type=='Id':
             du_1,du_2 = self.get_dphi(XI,N_v,flag,model,value='phi')
-            loss += tf.reduce_mean(tf.square(du_1*self.PDE_in.epsilon - du_2*self.PDE_out.epsilon))
+            loss += torch.mean((du_1*self.PDE_in.epsilon - du_2*self.PDE_out.epsilon)**2)
         
         elif loss_type=='Ir':
             r1 = self.PDE_in.get_r(self.mesh,model,X,None,'molecule')
             r2 = self.PDE_out.get_r(self.mesh,model,X,None,'solvent')
-            loss += tf.reduce_mean(tf.square(r1-r2)) 
+            loss += torch.mean((r1-r2)**2)
             
         return loss
 
     def get_loss_experimental(self,model,X_exp):             
 
-        loss = tf.constant(0.0, dtype=self.DTYPE)
+        loss = torch.tensor(0.0, dtype=self.dtype)
         n = len(X_exp)
         ((X,X_values),flag,method) = X_exp
         q_L,phi_ens_exp_L = zip(*X_values)
         phi_ens_pred_L = self.get_phi_ens(model,(X,flag),q_L,method)
 
         for phi_pred,phi_exp in zip(phi_ens_pred_L,phi_ens_exp_L):
-            loss += tf.square(phi_pred - phi_exp)
+            loss += (phi_pred - phi_exp)**2
 
         loss *= (1/n)
 
@@ -250,8 +265,8 @@ class PBE(Solution_utils):
         du_1,du_2 = self.get_dphi(XI,N_v,flag,model,value='phi')
         du_prom = (du_1*self.PDE_in.epsilon + du_2*self.PDE_out.epsilon)/2
 
-        integral = tf.reduce_sum(du_prom * areas)
-        loss += tf.reduce_mean(tf.square(integral - self.total_charge))
+        integral = torch.sum(du_prom * areas)
+        loss += torch.mean((integral - self.total_charge)**2)
 
         return loss
 
@@ -270,42 +285,44 @@ class PBE(Solution_utils):
 
     def laplacian(self,mesh,model,X,flag,value='phi'):
         x,y,z = X
-        with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape:
-            tape.watch(x)
-            tape.watch(y)
-            tape.watch(z)
-            with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape2:
-                tape2.watch(x)
-                tape2.watch(y)
-                tape2.watch(z)
-                R = mesh.stack_X(x,y,z)
-                u = self.get_phi(R,flag,model,value)
-            u_x = tape2.gradient(u,x)
-            u_y = tape2.gradient(u,y)
-            u_z = tape2.gradient(u,z)
-        u_xx = tape.gradient(u_x,x)
-        u_yy = tape.gradient(u_y,y)
-        u_zz = tape.gradient(u_z,z)
-        del tape
-        del tape2
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        z = z.requires_grad_(True)
+        
+        R = mesh.stack_X(x,y,z)
+        u = self.get_phi(R,flag,model,value)
+        
+        # First derivatives
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_z = torch.autograd.grad(u, z, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        
+        # Second derivatives
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
+        u_zz = torch.autograd.grad(u_z, z, grad_outputs=torch.ones_like(u_z), create_graph=True)[0]
+        
         return u_xx + u_yy + u_zz
 
     def gradient(self,mesh,model,X,flag,value='phi'):
         x,y,z = X
-        with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape:
-            tape.watch(x)
-            tape.watch(y)
-            tape.watch(z)
-            R = mesh.stack_X(x,y,z)
-            u = self.get_phi(R,flag,model,value)
-        u_x = tape.gradient(u,x)
-        u_y = tape.gradient(u,y)
-        u_z = tape.gradient(u,z)
-        del tape
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        z = z.requires_grad_(True)
+        
+        R = mesh.stack_X(x,y,z)
+        u = self.get_phi(R,flag,model,value)
+        
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_z = torch.autograd.grad(u, z, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        
         return (u_x,u_y,u_z)
     
     def directional_gradient(self,mesh,model,X,n_v,flag,value='phi'):
         gradient = self.gradient(mesh,model,X,flag,value)
+        # Ensure n_v tensors are on the same device as gradients
+        n_v = [nv.to(gradient[0].device) if torch.is_tensor(nv) else nv for nv in n_v]
         dir_deriv = 0
         for j in range(3):
             dir_deriv += n_v[j]*gradient[j]
@@ -323,9 +340,10 @@ class PBE(Solution_utils):
         for i,q in enumerate(self.q_list):
             self.qs[i] = q.q
             self.x_qs[i,:] = q.x_q        
-        self.total_charge = tf.constant(np.sum(self.qs), dtype=self.DTYPE)
-        self.qs = tf.constant(self.qs, dtype=self.DTYPE)
-        self.x_qs = tf.constant(self.x_qs, dtype=self.DTYPE)
+        torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        self.total_charge = torch.tensor(np.sum(self.qs), dtype=torch_dtype)
+        self.qs = torch.from_numpy(self.qs).to(torch_dtype)
+        self.x_qs = torch.from_numpy(self.x_qs).to(torch_dtype)
 
         radii = np.array([q.r_q for q in self.q_list])
         radii[radii<1e-6] = np.mean(radii)
@@ -333,49 +351,52 @@ class PBE(Solution_utils):
         scale_min_value_1, scale_max_value_1 = 0., 0.
         scale_min_value_2, scale_max_value_2 = 0., 0.
 
-        positions = self.x_qs
+        positions = torch.from_numpy(self.x_qs).float() if isinstance(self.x_qs, np.ndarray) else self.x_qs
         radii = np.array([q.r_q for q in self.q_list])
         radii[radii<1e-6] = np.mean(radii)
-        radii = tf.constant(radii, dtype=self.DTYPE)
+        radii = torch.from_numpy(radii).float()
         num_charges = len(self.q_list)
 
-        positions_expanded = tf.expand_dims(positions, axis=1)
-        positions_diff = tf.norm(positions_expanded - positions, axis=2)
-        mask = tf.not_equal(positions_diff, 0) 
+        positions_expanded = positions.unsqueeze(1)
+        positions_diff = torch.norm(positions_expanded - positions, dim=2)
+        mask = positions_diff != 0
 
         phi_born_all = self.charges_Born_Ion(0.0,radii,self.qs)
 
-        def compute_phi_contribs(idx):
-            valid_indices = tf.boolean_mask(tf.range(num_charges), mask[idx])
-            diff_positions = tf.boolean_mask(positions_diff[idx], mask[idx])
-            phi_contribs = tf.map_fn(
-                lambda j: self.charges_Born_Ion(diff_positions[j], R=diff_positions[j], q=self.qs[valid_indices[j]]),
-                tf.range(tf.size(valid_indices)), dtype=self.DTYPE
-            )
-            return tf.reduce_sum(phi_contribs, axis=0)
-        phi_contribs_all = tf.vectorized_map(compute_phi_contribs, tf.range(num_charges))
+        phi_contribs_all = []
+        for idx in range(num_charges):
+            valid_indices = torch.where(mask[idx])[0]
+            diff_positions = positions_diff[idx][mask[idx]]
+            phi_contribs = torch.stack([
+                self.charges_Born_Ion(diff_positions[j].item(), R=diff_positions[j].item(), q=self.qs[valid_indices[j].item()])
+                for j in range(len(valid_indices))
+            ])
+            phi_contribs_all.append(torch.sum(phi_contribs))
+        phi_contribs_all = torch.tensor(phi_contribs_all, dtype=self.dtype)
 
         phi_total_all = phi_born_all + phi_contribs_all
 
-        G_additions = self.G(positions + tf.concat([tf.expand_dims(radii, axis=1), tf.zeros_like(positions[:, 1:3])], axis=1))
+        radii_col = radii.unsqueeze(1)
+        zeros_col = torch.zeros_like(positions[:, 1:3])
+        G_additions = self.G(positions + torch.cat([radii_col, zeros_col], dim=1))
 
-        phi_max_all = tf.reshape(tf.maximum(phi_born_all,phi_total_all), (-1,1))
-        phi_min_all = tf.reshape(tf.minimum(phi_born_all,phi_total_all), (-1,1))
+        phi_max_all = torch.maximum(phi_born_all, phi_total_all).reshape(-1,1)
+        phi_min_all = torch.minimum(phi_born_all, phi_total_all).reshape(-1,1)
 
-        phi_1_max_all = tf.where(tf.equal(self.fields[0], 'phi'), phi_max_all + G_additions, phi_max_all)
-        phi_1_min_all = tf.where(tf.equal(self.fields[0], 'phi'), phi_min_all + G_additions, phi_min_all)
-        phi_2_max_all = tf.where(tf.equal(self.fields[1], 'phi'), phi_max_all + G_additions, phi_max_all)
-        phi_2_min_all = tf.where(tf.equal(self.fields[1], 'phi'), phi_min_all + G_additions, phi_min_all)
+        phi_1_max_all = phi_max_all + G_additions if self.fields[0] == 'phi' else phi_max_all
+        phi_1_min_all = phi_min_all + G_additions if self.fields[0] == 'phi' else phi_min_all
+        phi_2_max_all = phi_max_all + G_additions if self.fields[1] == 'phi' else phi_max_all
+        phi_2_min_all = phi_min_all + G_additions if self.fields[1] == 'phi' else phi_min_all
 
-        phi_1_max = tf.reduce_max(phi_1_max_all)
-        phi_1_min = tf.reduce_min(phi_1_min_all)
-        phi_2_max = tf.reduce_max(phi_2_max_all)
-        phi_2_min = tf.reduce_min(phi_2_min_all)
+        phi_1_max = torch.max(phi_1_max_all)
+        phi_1_min = torch.min(phi_1_min_all)
+        phi_2_max = torch.max(phi_2_max_all)
+        phi_2_min = torch.min(phi_2_min_all)
 
-        scale_max_value_1 = tf.maximum(0.0, phi_1_max)
-        scale_min_value_1 = tf.minimum(0.0, phi_1_min)
-        scale_max_value_2 = tf.maximum(0.0, phi_2_max)
-        scale_min_value_2 = tf.minimum(0.0, phi_2_min)
+        scale_max_value_1 = torch.maximum(torch.tensor(0.0), phi_1_max)
+        scale_min_value_1 = torch.minimum(torch.tensor(0.0), phi_1_min)
+        scale_max_value_2 = torch.maximum(torch.tensor(0.0), phi_2_max)
+        scale_min_value_2 = torch.minimum(torch.tensor(0.0), phi_2_min)
 
         self.scale_phi_1 = [float(scale_min_value_1), float(scale_max_value_1)]
         self.scale_phi_2 = [float(scale_min_value_2), float(scale_max_value_2)]
@@ -402,8 +423,9 @@ class PBE(Solution_utils):
         for i, element in enumerate(elements.T):
             centroids[:, i] = np.mean(vertices[:, element], axis=1)
 
-        self.mesh.grid_centroids = tf.reshape(tf.constant(centroids.transpose(),dtype=self.DTYPE), (-1,3))
-        self.mesh.grid_faces_normals = tf.reshape(tf.constant(faces_normals.transpose(),dtype=self.DTYPE), (-1,3))
+        torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        self.mesh.grid_centroids = torch.from_numpy(centroids.transpose()).to(torch_dtype).reshape(-1,3)
+        self.mesh.grid_faces_normals = torch.from_numpy(faces_normals.transpose()).to(torch_dtype).reshape(-1,3)
     
     def get_grid_coefficients_faces(self,model):
 
@@ -421,11 +443,14 @@ class PBE(Solution_utils):
 
 
     @classmethod
-    def create_L(cls):
+    def create_L(cls, device=None):
         cls.names = ['R1','D1','N1','K1','Q1','R2','D2','N2','K2','G','Iu','Id','Ir','E2','P1','P2','IB1','IB2']
         L = dict()
+        torch_dtype = torch.float32 if cls.DTYPE == 'float32' else torch.float64
+        if device is None:
+            device = torch.device('cpu')
         for t in cls.names:
-            L[t] = tf.constant(0.0, dtype=cls.DTYPE)
+            L[t] = torch.tensor(0.0, dtype=torch_dtype, device=device)
         return L
 
 

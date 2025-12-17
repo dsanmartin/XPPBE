@@ -1,6 +1,5 @@
 import numpy as np
-import scipy.optimize
-import tensorflow as tf
+import torch
 from time import time
 import logging
 from tqdm import tqdm as log_progress
@@ -12,34 +11,51 @@ class PINN(PINN_utils):
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)       
     
+    def move_batch_to_device(self, X_batch):
+        """Move batch data to the appropriate device (GPU/CPU)"""
+        X_batch_device = {}
+        for key, value in X_batch.items():
+            if isinstance(value, tuple):
+                # Handle nested tuples
+                X_batch_device[key] = tuple(
+                    tuple(v.to(self.device) if torch.is_tensor(v) else v for v in item) if isinstance(item, tuple)
+                    else item.to(self.device) if torch.is_tensor(item) else item
+                    for item in value
+                )
+            elif torch.is_tensor(value):
+                X_batch_device[key] = value.to(self.device)
+            else:
+                X_batch_device[key] = value
+        return X_batch_device
+    
     def get_loss(self, X_batch, model, w, validation=False):
+        # Move batch to device
+        X_batch = self.move_batch_to_device(X_batch)
         loss = 0.0
         L = self.PDE.get_loss(X_batch, model, validation=validation)
         for t in self.mesh.domain_mesh_names:
             loss += w[t]*L[t]
         return loss,L
 
-    def get_grad_loss(self,X_batch, model, trainable_variables, w):
-        with tf.GradientTape(persistent=True, watch_accessed_variables=False) as tape:
-            tape.watch(trainable_variables)
-            loss,L = self.get_loss(X_batch, model, w)
-        g = tape.gradient(loss, trainable_variables)
-        del tape
+    def get_grad_loss(self,X_batch, model, w):
+        loss,L = self.get_loss(X_batch, model, w)
+        loss.backward()
+        g = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in model.parameters()]
         return loss, L, g
     
 
     def train_sgd(self, X_d, X_v):
 
-        @tf.function
         def train_step(X_batch, ws):
-            loss, L_loss, grad_theta = self.get_grad_loss(X_batch, self.model, self.model.trainable_variables, ws)
-            self.optimizer.apply_gradients(zip(grad_theta, self.model.trainable_variables))
-            del grad_theta
+            self.optimizer.zero_grad()
+            loss, L_loss, grad_theta = self.get_grad_loss(X_batch, self.model, ws)
+            self.optimizer.step()
             L = [loss,L_loss]
             return L
         
-        @tf.function
         def calculate_validation_loss(X_v):
+            # Note: We need gradients for residual computation, so don't use torch.no_grad()
+            # The validation flag prevents parameter updates
             loss,L_loss = self.get_loss(X_v,self.model,self.w, validation=True)
             L = [loss,L_loss]
             return L
@@ -56,39 +72,39 @@ class PINN(PINN_utils):
 
     def train_newton(self, X_batch, X_batch_val):
 
-        def train_step(X_batch,X_batch_val):
-
-            def get_loss_grad(w):
-
-                self.set_weight_tensor(w)
-                loss, _ , grad_theta = self.get_grad_loss(X_batch, self.model, self.model.trainable_variables, self.w)
-
-                grad_flat = np.concatenate([g.numpy().flatten() for g in grad_theta], axis=0).astype(np.float64)
-
-                return loss, grad_flat
+        def train_step(X_batch, X_batch_val):
+            # Create LBFGS optimizer using YAML configuration
+            optimizer_lbfgs = torch.optim.LBFGS(
+                self.model.parameters(),
+                max_iter=self.optimizer_2_opts['maxiter'],
+                max_eval=self.optimizer_2_opts.get('maxfun', None),
+                tolerance_grad=self.optimizer_2_opts.get('gtol', 1e-5),
+                tolerance_change=self.optimizer_2_opts['ftol'],
+                history_size=self.optimizer_2_opts['maxcor'],
+                line_search_fn='strong_wolfe'
+            )
             
-            def callback_ts(w):
-                self.set_weight_tensor(w)
-                L = self.get_loss(X_batch,self.model,self.w)
-                L_v = self.get_loss(X_batch_val,self.model,self.w, validation=True)
-                self.complete_callback(L,L_v)
+            def closure():
+                """Closure function for LBFGS - computes loss and gradients"""
+                optimizer_lbfgs.zero_grad()
+                loss, L_loss = self.get_loss(X_batch, self.model, self.w)
+                loss.backward()
+                return loss
             
-            x0, _ = self.get_weight_tensor()
-            scipy.optimize.minimize(
-                            fun=get_loss_grad,
-                            x0=x0,
-                            jac=True,
-                            method=self.optimizer_2_name,
-                            options=self.optimizer_2_opts,
-                            callback=callback_ts)
+            # Run LBFGS optimization step (calls closure multiple times internally)
+            optimizer_lbfgs.step(closure)
+            
+            # Callback once after the full LBFGS step completes
+            loss, L_loss = self.get_loss(X_batch, self.model, self.w)
+            L_v = self.get_loss(X_batch_val, self.model, self.w, validation=True)
+            L = [loss, L_loss]
+            self.complete_callback(L, L_v)
 
-            
         for i in range(self.N_steps_2):
-
             if self.sample_method == 'random_sample':
                 X_batch = self.get_batches(self.sample_method)
             
-            train_step(X_batch,X_batch_val)
+            train_step(X_batch, X_batch_val)
             
             
     def main_loop(self, N=1000, N2=0):
@@ -97,7 +113,8 @@ class PINN(PINN_utils):
         self.N_steps_2 = N2
 
         if self.use_optimizer_2:
-            self.N_iters_2 = self.N_steps_2 * self.optimizer_2_opts['maxiter'] 
+            # Each LBFGS step produces one callback (not maxiter callbacks)
+            self.N_iters_2 = self.N_steps_2 
 
         N_total = self.N_iters + self.N_iters_2
         self.pbar = log_progress(range(N_total))
@@ -146,20 +163,20 @@ class PINN(PINN_utils):
         
         L = dict()
         if self.adapt_w_method == 'gradients':
-            with tf.GradientTape(persistent=True) as tape:
-                tape.watch(model.trainable_variables)
-                _,L_loss = self.get_loss(X_domain, model, self.w)
+            _,L_loss = self.get_loss(X_domain, model, self.w)
 
             for t in self.mesh.domain_mesh_names:
                 loss = L_loss[t]
-                grads = tape.gradient(loss, model.trainable_variables)
-                grads = [grad if grad is not None else tf.zeros_like(var) for grad, var in zip(grads, model.trainable_variables)]
-                gradient_norm = tf.sqrt(sum([tf.reduce_sum(tf.square(g)) for g in grads]))
-                L[t] = gradient_norm
-            del tape
+                model.zero_grad()
+                loss.backward(retain_graph=True)
+                grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in model.parameters()]
+                gradient_norm = torch.sqrt(sum([torch.sum(g**2) for g in grads]))
+                L[t] = gradient_norm.item()
 
         elif self.adapt_w_method == 'values':
-            _,L = self.get_loss(X_domain, model, self.w) 
+            with torch.no_grad():
+                _,L_temp = self.get_loss(X_domain, model, self.w)
+            L = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in L_temp.items()}
 
         eps = 1e-9
         loss_wo_w = sum(L.values())
@@ -170,12 +187,16 @@ class PINN(PINN_utils):
     def calculate_Indicators(self,calc_now):
         if calc_now:
             if self.Indicators['G_solv']:
-                self.current_G_solv = self.PDE.get_solvation_energy(self.model).numpy()
+                with torch.no_grad():
+                    G_solv_tensor = self.PDE.get_solvation_energy(self.model)
+                    self.current_G_solv = G_solv_tensor.cpu().numpy() if isinstance(G_solv_tensor, torch.Tensor) else G_solv_tensor
                 self.G_solv_hist[str(self.iter)] = self.current_G_solv   
 
             if self.Indicators['L2_error_phi']:
-                phi_pinn = self.PDE.get_phi_interface_verts(self.model,value='react')[0]
-                phi_dif = (phi_pinn.numpy().reshape(-1,1) - self.phi_known_L2.reshape(-1,1))
+                with torch.no_grad():
+                    phi_pinn = self.PDE.get_phi_interface_verts(self.model,value='react')[0]
+                    phi_pinn_np = phi_pinn.cpu().numpy() if isinstance(phi_pinn, torch.Tensor) else phi_pinn
+                phi_dif = (phi_pinn_np.reshape(-1,1) - self.phi_known_L2.reshape(-1,1))
                 error = np.sqrt(np.sum(phi_dif**2)/np.sum(self.phi_known_L2.reshape(-1,1)**2))
 
                 self.current_L2_error = error

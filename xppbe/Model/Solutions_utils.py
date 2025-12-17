@@ -1,5 +1,5 @@
 import numpy as np
-import tensorflow as tf
+import torch
 from scipy import special as sp
 from functools import wraps
 
@@ -50,103 +50,141 @@ class Solution_utils():
 
     @adim_function
     def G(self,X):
-        r_vec_expanded = tf.expand_dims(X, axis=1)
-        x_qs_expanded = tf.expand_dims(self.x_qs, axis=0)
+        # Convert to tensor if numpy
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X).float()
+        x_qs = torch.from_numpy(self.x_qs).float() if isinstance(self.x_qs, np.ndarray) else self.x_qs
+        qs = torch.from_numpy(self.qs).float() if isinstance(self.qs, np.ndarray) else self.qs
+        
+        # Move to same device as X
+        x_qs = x_qs.to(X.device)
+        qs = qs.to(X.device)
+        
+        r_vec_expanded = X.unsqueeze(1)
+        x_qs_expanded = x_qs.unsqueeze(0)
         r_diff = r_vec_expanded - x_qs_expanded
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))
-        q_over_r = self.qs / r
-        total_sum = tf.reduce_sum(q_over_r, axis=1)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))
+        q_over_r = qs / r
+        total_sum = torch.sum(q_over_r, dim=1)
         result = (1 / (self.epsilon_1 * 4 * self.pi)) * total_sum
-        result = tf.expand_dims(result, axis=1)
+        result = result.unsqueeze(1)
         return result
     
     @adim_function
     def dG_n(self,X,n):
-        r_vec_expanded = tf.expand_dims(X, axis=1)
-        x_qs_expanded = tf.expand_dims(self.x_qs, axis=0)
+        # Convert to tensor if numpy
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X).float()
+        if isinstance(n, np.ndarray):
+            n = torch.from_numpy(n).float()
+        x_qs = torch.from_numpy(self.x_qs).float() if isinstance(self.x_qs, np.ndarray) else self.x_qs
+        qs = torch.from_numpy(self.qs).float() if isinstance(self.qs, np.ndarray) else self.qs
+        
+        # Move to same device as X
+        x_qs = x_qs.to(X.device)
+        qs = qs.to(X.device)
+        n = n.to(X.device)
+        
+        r_vec_expanded = X.unsqueeze(1)
+        x_qs_expanded = x_qs.unsqueeze(0)
         r_diff = r_vec_expanded - x_qs_expanded
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))
-        dg_dr = self.qs / (r**3) * (-1 / (self.epsilon_1 * 4 * self.pi)) * (1/2)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))
+        dg_dr = qs / (r**3) * (-1 / (self.epsilon_1 * 4 * self.pi)) * (1/2)
         dx = dg_dr * 2*r_diff[:, :, 0]
         dy = dg_dr * 2*r_diff[:, :, 1]
         dz = dg_dr * 2*r_diff[:, :, 2]
-        dx_sum = tf.reduce_sum(dx, axis=1)
-        dy_sum = tf.reduce_sum(dy, axis=1)
-        dz_sum = tf.reduce_sum(dz, axis=1)
+        dx_sum = torch.sum(dx, dim=1)
+        dy_sum = torch.sum(dy, dim=1)
+        dz_sum = torch.sum(dz, dim=1)
         dg_dn = n[:, 0] * dx_sum + n[:, 1] * dy_sum + n[:, 2] * dz_sum
-        return tf.reshape(dg_dn, (-1, 1)) 
+        return dg_dn.reshape(-1, 1) 
     
 
     def source(self,X):
-        r_vec_expanded = tf.expand_dims(X, axis=1)
-        x_qs_expanded = tf.expand_dims(self.x_qs, axis=0)
+        x_qs = self.x_qs.to(X.device) if torch.is_tensor(self.x_qs) else torch.from_numpy(self.x_qs).float().to(X.device)
+        qs = self.qs.to(X.device) if torch.is_tensor(self.qs) else torch.from_numpy(self.qs).float().to(X.device)
+        
+        r_vec_expanded = X.unsqueeze(1)
+        x_qs_expanded = x_qs.unsqueeze(0)
         r_diff = r_vec_expanded - x_qs_expanded
-        r2 = tf.reduce_sum(tf.square(r_diff), axis=2)
-        delta = tf.exp((-1/(2*self.sigma**2))*r2)
-        q_times_delta = self.qs*delta
-        total_sum = tf.reduce_sum(q_times_delta, axis=1)
+        r2 = torch.sum(r_diff**2, dim=2)
+        delta = torch.exp((-1/(2*self.sigma**2))*r2)
+        q_times_delta = qs*delta
+        total_sum = torch.sum(q_times_delta, dim=1)
         normalizer = (1/((2*self.pi)**(3.0/2)*self.sigma**3))
         result = (-1/self.epsilon_1)*normalizer * total_sum
-        result = tf.expand_dims(result, axis=1)
+        result = result.unsqueeze(1)
         return result
         
     @adim_function
     def G_Yukawa(self,X):
-        r_vec_expanded = tf.expand_dims(X, axis=1)
-        x_qs_expanded = tf.expand_dims(self.x_qs, axis=0)
+        x_qs = self.x_qs.to(X.device) if torch.is_tensor(self.x_qs) else torch.from_numpy(self.x_qs).float().to(X.device)
+        qs = self.qs.to(X.device) if torch.is_tensor(self.qs) else torch.from_numpy(self.qs).float().to(X.device)
+        kappa = self.kappa.to(X.device) if torch.is_tensor(self.kappa) else self.kappa
+        
+        r_vec_expanded = X.unsqueeze(1)
+        x_qs_expanded = x_qs.unsqueeze(0)
         r_diff = r_vec_expanded - x_qs_expanded
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))
-        q_over_r = self.qs*tf.exp(-self.kappa*r) / r
-        total_sum = tf.reduce_sum(q_over_r, axis=1)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))
+        q_over_r = qs*torch.exp(-kappa*r) / r
+        total_sum = torch.sum(q_over_r, dim=1)
         result = (1 / (self.epsilon_2 * 4 * self.pi)) * total_sum
-        result = tf.expand_dims(result, axis=1)
+        result = result.unsqueeze(1)
         return result
 
 
     def G_L(self,X,Xp):
-        X_expanded = tf.expand_dims(X, axis=1)  # Shape: (n, 1, 3)
-        Xp_expanded = tf.expand_dims(Xp, axis=0)  # Shape: (1, m, 3)
+        Xp = Xp.to(X.device) if torch.is_tensor(Xp) and Xp.device != X.device else Xp
+        X_expanded = X.unsqueeze(1)  # Shape: (n, 1, 3)
+        Xp_expanded = Xp.unsqueeze(0)  # Shape: (1, m, 3)
         r_diff = X_expanded - Xp_expanded  # Shape: (n, m, 3)
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))  # Shape: (n, m)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))  # Shape: (n, m)
         over_r = 1 / r  # Shape: (n, m)
         green_function = (1 / (4 * self.pi)) * over_r  # Shape: (n, m)
         return green_function
     
     def G_Y(self,X,Xp):
-        X_expanded = tf.expand_dims(X, axis=1)  # Shape: (n, 1, 3)
-        Xp_expanded = tf.expand_dims(Xp, axis=0)  # Shape: (1, m, 3)
+        Xp = Xp.to(X.device) if torch.is_tensor(Xp) and Xp.device != X.device else Xp
+        kappa = self.kappa.to(X.device) if torch.is_tensor(self.kappa) else self.kappa
+        X_expanded = X.unsqueeze(1)  # Shape: (n, 1, 3)
+        Xp_expanded = Xp.unsqueeze(0)  # Shape: (1, m, 3)
         r_diff = X_expanded - Xp_expanded  # Shape: (n, m, 3)
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))  # Shape: (n, m)
-        e_over_r = tf.exp(-self.kappa*r) / r  # Shape: (n, m)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))  # Shape: (n, m)
+        e_over_r = torch.exp(-kappa*r) / r  # Shape: (n, m)
         green_function = (1 / (4 * self.pi)) * e_over_r  # Shape: (n, m)
         return green_function
     
     def dG_L(self,X,Xp,N):
-        X_expanded = tf.expand_dims(X, axis=1)  # Shape: (n, 1, 3)
-        Xp_expanded = tf.expand_dims(Xp, axis=0)  # Shape: (1, m, 3)
-        n_expanded = tf.expand_dims(N, axis=0)  # Shape: (1, m, 3)
+        Xp = Xp.to(X.device) if torch.is_tensor(Xp) and Xp.device != X.device else Xp
+        N = N.to(X.device) if torch.is_tensor(N) and N.device != X.device else N
+        X_expanded = X.unsqueeze(1)  # Shape: (n, 1, 3)
+        Xp_expanded = Xp.unsqueeze(0)  # Shape: (1, m, 3)
+        n_expanded = N.unsqueeze(0)  # Shape: (1, m, 3)
         r_diff = X_expanded - Xp_expanded  # Shape: (n, m, 3)
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))  # Shape: (n, m)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))  # Shape: (n, m)
         dg_dr = (-1 / (4 * self.pi)) / (r**2)  # Shape: (n, m)
         grad_x = -1*dg_dr * r_diff[:, :, 0] / r  # Shape: (n, m)
         grad_y = -1*dg_dr * r_diff[:, :, 1] / r  # Shape: (n, m)
         grad_z = -1*dg_dr * r_diff[:, :, 2] / r  # Shape: (n, m)
-        grad = tf.stack([grad_x, grad_y, grad_z], axis=2)  # Shape: (n, m, 3)
-        dg_dn = tf.reduce_sum(grad * n_expanded, axis=2)  # Shape: (n, m)
+        grad = torch.stack([grad_x, grad_y, grad_z], dim=2)  # Shape: (n, m, 3)
+        dg_dn = torch.sum(grad * n_expanded, dim=2)  # Shape: (n, m)
         return dg_dn
 
     def dG_Y(self,X,Xp,N):
-        X_expanded = tf.expand_dims(X, axis=1)  # Shape: (n, 1, 3)
-        Xp_expanded = tf.expand_dims(Xp, axis=0)  # Shape: (1, m, 3)
-        n_expanded = tf.expand_dims(N, axis=0)  # Shape: (1, m, 3)
+        Xp = Xp.to(X.device) if torch.is_tensor(Xp) and Xp.device != X.device else Xp
+        N = N.to(X.device) if torch.is_tensor(N) and N.device != X.device else N
+        kappa = self.kappa.to(X.device) if torch.is_tensor(self.kappa) else self.kappa
+        X_expanded = X.unsqueeze(1)  # Shape: (n, 1, 3)
+        Xp_expanded = Xp.unsqueeze(0)  # Shape: (1, m, 3)
+        n_expanded = N.unsqueeze(0)  # Shape: (1, m, 3)
         r_diff = X_expanded - Xp_expanded  # Shape: (n, m, 3)
-        r = tf.sqrt(tf.reduce_sum(tf.square(r_diff), axis=2))  # Shape: (n, m)
-        dg_dr = (-tf.exp(-self.kappa*r) / (4 * self.pi)) / (r)  *(-self.kappa/r - 1/r**2) # Shape: (n, m)
+        r = torch.sqrt(torch.sum(r_diff**2, dim=2))  # Shape: (n, m)
+        dg_dr = (-torch.exp(-kappa*r) / (4 * self.pi)) / (r)  *(-kappa/r - 1/r**2) # Shape: (n, m)
         grad_x = -1*dg_dr * r_diff[:, :, 0] / r  # Shape: (n, m)
         grad_y = -1*dg_dr * r_diff[:, :, 1] / r  # Shape: (n, m)
         grad_z = -1*dg_dr * r_diff[:, :, 2] / r  # Shape: (n, m)
-        grad = tf.stack([grad_x, grad_y, grad_z], axis=2)  # Shape: (n, m, 3)
-        dg_dn = tf.reduce_sum(grad * n_expanded, axis=2)  # Shape: (n, m)
+        grad = torch.stack([grad_x, grad_y, grad_z], dim=2)  # Shape: (n, m, 3)
+        dg_dn = torch.sum(grad * n_expanded, dim=2)  # Shape: (n, m)
         return dg_dn
         
 
@@ -241,7 +279,8 @@ class Solution_utils():
 
             PHI[K] = np.real(phi)
         
-        return tf.constant(PHI, dtype=self.DTYPE) 
+        torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        return torch.from_numpy(PHI).to(torch_dtype) 
 
     @staticmethod
     def get_K(x, n):

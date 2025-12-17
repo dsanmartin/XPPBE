@@ -3,7 +3,7 @@ import copy
 import json
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
 
 class PINN_utils():
 
@@ -12,6 +12,10 @@ class PINN_utils():
     def __init__(self, results_path):
 
         self.results_path = results_path
+        
+        # Set device for GPU/CPU
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
         self.losses_names = ['TL','TL1','TL2','vTL1','vTL2','R1','D1','N1','K1','Q1','R2','D2','N2','K2','G','Iu','Id','Ir','E2','P1','P2','IB1','IB2']
         self.losses_names_1 = ['TL1','R1','D1','N1','K1','Q1','Iu','Id','Ir','G','P1','IB1']
         self.losses_names_2 = ['TL2','R2','D2','N2','K2','Iu','Id','Ir','E2','G','P2','IB2']
@@ -37,15 +41,19 @@ class PINN_utils():
         self.hyperparameters = hyperparameters
         self.model = NN_class(hyperparameters,bc_param, *args, **kwargs)
         self.model.build_Net()
+        # Move model to GPU if available
+        self.model = self.model.to(self.device)
+        print(f"Model moved to {self.device}")
 
     def adapt_optimizer(self,optimizer,lr,optimizer2=False,options2=None):
         self.optimizer_name = optimizer
         if lr['method']=='exponential_decay':
-            self.lr = tf.keras.optimizers.schedules.ExponentialDecay(
-                    initial_learning_rate=lr['initial_learning_rate'],
-                    decay_steps=lr['decay_steps'],
-                    decay_rate=lr['decay_rate'],
-                    staircase=lr['staircase'])
+            self.lr = lr['initial_learning_rate']
+            self.lr_decay_steps = lr['decay_steps']
+            self.lr_decay_rate = lr['decay_rate']
+            self.lr_staircase = lr['staircase']
+        else:
+            self.lr = lr if isinstance(lr, (int, float)) else lr.get('initial_learning_rate', 0.001)
 
         if optimizer2:
             self.optimizer_2_name = optimizer2
@@ -69,9 +77,9 @@ class PINN_utils():
         self.w = dict()
         for w_name in self.w_names:
             if not w_name in weights:
-                self.w[w_name] = tf.constant(1.0, dtype=self.DTYPE)
+                self.w[w_name] = 1.0
             else:
-                self.w[w_name] = tf.constant(float(weights[w_name]), dtype=self.DTYPE)
+                self.w[w_name] = float(weights[w_name])
 
         self.w_hist = dict()
 
@@ -125,14 +133,20 @@ class PINN_utils():
     def create_optimizer(self, starting_point):
         
         if self.optimizer_name == 'Adam':
-            optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        elif self.optimizer_name == 'LBFGS':
+            optimizer = torch.optim.LBFGS(
+                self.model.parameters(),
+                lr=self.lr if isinstance(self.lr, float) else 1.0,
+                max_iter=20,
+                history_size=100,
+                line_search_fn='strong_wolfe'
+            )
+        else:
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
             
-        if starting_point == 'continue':
-            zero_grads = [tf.zeros_like(w) for w in self.model.trainable_variables]
-            saved_vars = [tf.identity(w) for w in self.model.trainable_variables]
-            optimizer.apply_gradients(zip(zero_grads, self.model.trainable_variables))
-            [x.assign(y) for x,y in zip(self.model.trainable_variables, saved_vars)]
-            optimizer.set_weights(self.loaded_opt_weights)
+        if starting_point == 'continue' and hasattr(self, 'loaded_opt_weights'):
+            optimizer.load_state_dict(self.loaded_opt_weights)
             
         return optimizer
 
@@ -170,27 +184,28 @@ class PINN_utils():
     def get_weight_tensor(self):
         weight_list = []
         shape_list = []
-        for v in self.model.trainable_variables:
-            shape_list.append(v.shape)
-            weight_list.extend(v.numpy().flatten())
-        weight_list = tf.convert_to_tensor(weight_list)
+        for p in self.model.parameters():
+            shape_list.append(p.shape)
+            weight_list.extend(p.data.cpu().numpy().flatten())
+        weight_list = np.array(weight_list)
         return weight_list, shape_list
 
     def set_weight_tensor(self,weight_list):
         idx = 0
-        for v in self.model.trainable_variables:
-            vs = v.shape
-            if len(vs) == 2:  
-                sw = vs[0]*vs[1]
-                new_val = tf.reshape(weight_list[idx:idx+sw],(vs[0],vs[1]))
+        for p in self.model.parameters():
+            ps = p.shape
+            if len(ps) == 2:  
+                sw = ps[0]*ps[1]
+                new_val = torch.from_numpy(weight_list[idx:idx+sw].reshape(ps[0],ps[1]))
                 idx += sw
-            elif len(vs) == 1:
-                new_val = weight_list[idx:idx+vs[0]]
-                idx += vs[0]
-            elif len(vs) == 0:
-                new_val = weight_list[idx]
+            elif len(ps) == 1:
+                new_val = torch.from_numpy(weight_list[idx:idx+ps[0]])
+                idx += ps[0]
+            elif len(ps) == 0:
+                new_val = torch.from_numpy(np.array(weight_list[idx]))
                 idx += 1
-            v.assign(tf.cast(new_val, self.DTYPE))
+            dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+            p.data = new_val.to(dtype).to(p.device)
 
 
     #utils
@@ -218,13 +233,15 @@ class PINN_utils():
 
         for t in self.losses_names:
             if not 'TL' in t:
-                self.losses[t][i] = L[t].numpy()
+                loss_val = L[t].item() if isinstance(L[t], torch.Tensor) else L[t]
+                self.losses[t][i] = loss_val
                 if t in self.validation_names:
-                    self.validation_losses[t][i] = Lv[t].numpy()
+                    lossv_val = Lv[t].item() if isinstance(Lv[t], torch.Tensor) else Lv[t]
+                    self.validation_losses[t][i] = lossv_val
 
-        self.losses['TL'][i] = loss.numpy()
-        self.validation_losses['TL'][i] = lossv.numpy()
-        self.current_loss = loss.numpy()
+        self.losses['TL'][i] = loss.item() if isinstance(loss, torch.Tensor) else loss
+        self.validation_losses['TL'][i] = lossv.item() if isinstance(lossv, torch.Tensor) else lossv
+        self.current_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
 
         loss1 = 0.0
         loss1v = 0.0
@@ -235,9 +252,9 @@ class PINN_utils():
                 if t in self.validation_names:
                     loss1v += L[t]
                     loss1_vl += Lv[t]
-        self.losses['TL1'][i] = loss1.numpy()
-        self.losses['vTL1'][i] = loss1v.numpy()
-        self.validation_losses['TL1'][i] = loss1_vl.numpy()
+        self.losses['TL1'][i] = loss1.item() if isinstance(loss1, torch.Tensor) else loss1
+        self.losses['vTL1'][i] = loss1v.item() if isinstance(loss1v, torch.Tensor) else loss1v
+        self.validation_losses['TL1'][i] = loss1_vl.item() if isinstance(loss1_vl, torch.Tensor) else loss1_vl
 
         loss2 = 0.0
         loss2v = 0.0
@@ -248,9 +265,9 @@ class PINN_utils():
                 if t in self.validation_names:
                     loss2v += L[t]
                     loss2_vl += Lv[t]
-        self.losses['TL2'][i] = loss2.numpy()
-        self.losses['vTL2'][i] = loss2v.numpy()
-        self.validation_losses['TL2'][i] = loss2_vl.numpy()
+        self.losses['TL2'][i] = loss2.item() if isinstance(loss2, torch.Tensor) else loss2
+        self.losses['vTL2'][i] = loss2v.item() if isinstance(loss2v, torch.Tensor) else loss2v
+        self.validation_losses['TL2'][i] = loss2_vl.item() if isinstance(loss2_vl, torch.Tensor) else loss2_vl
         
         for t in self.w_names:
             self.w_hist[t][i] = self.w[t]
@@ -272,7 +289,10 @@ class PINN_utils():
         hyperparameters = [hyper['Molecule_NN'],hyper['Solvent_NN']]
         self.create_NeuralNet(NN_class, hyperparameters, bc_param)
 
-        self.model.load_weights(os.path.join(path,'weights'))
+        # Load PyTorch model weights
+        weights_path = os.path.join(path,'weights.pth')
+        if os.path.exists(weights_path):
+            self.model.load_state_dict(torch.load(weights_path))
         self.iter = Iter
         
         path_load = os.path.join(path,'w_hist.csv')
@@ -280,7 +300,7 @@ class PINN_utils():
         self.w_hist,self.w = dict(),dict()
         for t in self.w_names:
             self.w_hist[t] = np.array(df[t])
-            self.w[t] = tf.constant(self.w_hist[t][self.iter-1], dtype=self.DTYPE)
+            self.w[t] = float(self.w_hist[t][self.iter-1])
        
         path_load = os.path.join(path,'loss.csv')
         df = pd.read_csv(path_load)
@@ -302,15 +322,18 @@ class PINN_utils():
         for iters,L2_phi_error in zip(list(df_3['iter']),list(df_3['L2_phi_error'])):
             self.L2_error_hist[str(iters)] = L2_phi_error
 
-        path_load = os.path.join(path, 'optimizer.npy')
-        self.loaded_opt_weights = np.load(path_load, allow_pickle=True)
+        path_load = os.path.join(path, 'optimizer.pth')
+        if os.path.exists(path_load):
+            self.loaded_opt_weights = torch.load(path_load)
 
 
     def save_model(self,dir_save):
 
         if not os.path.exists(dir_save):
             os.makedirs(dir_save)
-        self.model.save_weights(os.path.join(dir_save,'weights'))
+        
+        # Save PyTorch model weights
+        torch.save(self.model.state_dict(), os.path.join(dir_save,'weights.pth'))
 
         df = pd.DataFrame.from_dict(self.w_hist)
         path_save = os.path.join(dir_save,'w_hist.csv')
@@ -338,5 +361,6 @@ class PINN_utils():
         with open(path_save, "w") as json_file:
             json.dump({'Molecule_NN': self.hyperparameters[0], 'Solvent_NN': self.hyperparameters[1]}, json_file, indent=4)     
 
-        np.save(os.path.join(dir_save, 'optimizer'), np.array(self.optimizer.get_weights(), dtype=object))
+        # Save PyTorch optimizer state
+        torch.save(self.optimizer.state_dict(), os.path.join(dir_save, 'optimizer.pth'))
 

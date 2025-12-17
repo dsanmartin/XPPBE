@@ -1,70 +1,69 @@
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
 
 
-class PINN_2Dom_NeuralNet(tf.keras.Model):
+class PINN_2Dom_NeuralNet(nn.Module):
 
     def __init__(self, hyperparameters, bc_param=None, **kwargs):
-        super().__init__(name='PINN_NN', **kwargs)
+        super().__init__()
         param_1, param_2 = hyperparameters
         if bc_param is None:
-            self.NNs = [NeuralNet(**param_1, name='Molecule_NN'), NeuralNet(**param_2, name='Solvent_NN')]
+            self.NNs = nn.ModuleList([NeuralNet(**param_1), NeuralNet(**param_2)])
         else:
-            self.NNs = [NeuralNet(**param_1, name='Molecule_NN'), NeuralNet_constrained(param_2,bc_param, name='Solvent_NN_c')]
+            self.NNs = nn.ModuleList([NeuralNet(**param_1), NeuralNet_constrained(param_2, bc_param)])
         
 
-    def call(self, X, flag):
-        outputs = tf.zeros([tf.shape(X)[0], 2])   
+    def forward(self, X, flag):
         if flag == 'molecule':
             output = self.NNs[0](X)
-            outputs = tf.concat([output, tf.zeros_like(output)], axis=1)
+            outputs = torch.cat([output, torch.zeros_like(output)], dim=1)
         elif flag == 'solvent':
             output = self.NNs[1](X)
-            outputs = tf.concat([tf.zeros_like(output), output], axis=1)
+            outputs = torch.cat([torch.zeros_like(output), output], dim=1)
         elif flag =='interface':
-            outputs = tf.concat([self.NNs[0](X), self.NNs[1](X)], axis=1)
+            outputs = torch.cat([self.NNs[0](X), self.NNs[1](X)], dim=1)
         return outputs
     
     def build_Net(self):
-        self.NNs[0].build_Net()
-        self.NNs[1].build_Net()
+        pass  # Not needed in PyTorch
 
 
-class PINN_1Dom_NeuralNet(tf.keras.Model):
+class PINN_1Dom_NeuralNet(nn.Module):
 
     def __init__(self, hyperparameters, bc_param=None, **kwargs):
-        super().__init__(name='PINN_NN', **kwargs)
+        super().__init__()
         param_1, param_2 = hyperparameters
-        self.NN = NeuralNet(**param_1, name='NN')
-        self.NNs = [self.NN,self.NN]
+        self.NN = NeuralNet(**param_1)
+        self.NNs = [self.NN, self.NN]
 
-    def call(self, X, flag):
+    def forward(self, X, flag):
         output = self.NN(X)
-        outputs = tf.concat([output, output], axis=1)
+        outputs = torch.cat([output, output], dim=1)
         return outputs
     
     def build_Net(self):
-        self.NN.build_Net()
+        pass  # Not needed in PyTorch
 
 
-class NeuralNet_constrained(tf.keras.Model):
+class NeuralNet_constrained(nn.Module):
     
     def __init__(self, hyperparameters, bc_param, **kwargs):
-        super().__init__(**kwargs) 
+        super().__init__() 
         self.fun = bc_param['fun']
         self.R_sphere = float(bc_param['R'])
-        self.NN = NeuralNet(**hyperparameters, name=kwargs['name'].replace('_c',''))
+        self.NN = NeuralNet(**hyperparameters)
         self.input_shape_N = self.NN.input_shape_N
 
-    def call(self, X):
-        output = self.NN(X)*(self.R_sphere-tf.norm(X, axis=1, keepdims=True))/self.R_sphere + self.fun(X)
+    def forward(self, X):
+        output = self.NN(X) * (self.R_sphere - torch.norm(X, dim=1, keepdim=True)) / self.R_sphere + self.fun(X)
         return output
     
     def build_Net(self):
-        self.NN.build_Net()
+        pass  # Not needed in PyTorch
         
 
-class NeuralNet(tf.keras.Model):
+class NeuralNet(nn.Module):
 
     DTYPE = 'float32'
 
@@ -87,7 +86,10 @@ class NeuralNet(tf.keras.Model):
                  scale_input_s=[[-1.,-1.,-1.],[1.,1.,1.]],
                  scale_output_s=[-1.,1.],
                  **kwargs):
-        super().__init__(**kwargs)
+        super().__init__()
+        
+        # Store input_dim from input_shape
+        self.input_dim = input_shape[-1] if isinstance(input_shape, (list, tuple)) else input_shape
 
         self.input_shape_N = input_shape
         self.output_dim = output_dim
@@ -106,35 +108,23 @@ class NeuralNet(tf.keras.Model):
         self.weight_factorization = weight_factorization
  
         self.scale_input = scale_input
-        self.input_lb = tf.constant(scale_input_s[0], dtype=self.DTYPE)
-        self.input_ub = tf.constant(scale_input_s[1], dtype=self.DTYPE)
+        dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        self.register_buffer('input_lb', torch.tensor(scale_input_s[0], dtype=dtype))
+        self.register_buffer('input_ub', torch.tensor(scale_input_s[1], dtype=dtype))
 
         self.scale_output = scale_output
-        self.output_lb = tf.constant(scale_output_s[0], dtype=self.DTYPE)
-        self.output_ub = tf.constant(scale_output_s[1], dtype=self.DTYPE)
+        self.register_buffer('output_lb', torch.tensor(scale_output_s[0], dtype=dtype))
+        self.register_buffer('output_ub', torch.tensor(scale_output_s[1], dtype=dtype))
 
 
-        if not self.weight_factorization:
-            self.Dense_Layer = tf.keras.layers.Dense
-        elif self.weight_factorization:
-            self.Dense_Layer = CustomDenseLayer
-
-        # Scale layer
-        if self.scale_input:
-            self.scale_in = tf.keras.layers.Lambda(
-                            lambda x: 2.0 * (x - self.input_lb) / (self.input_ub - self.input_lb) - 1.0, 
-                            name=f'scale_layer')
+        self.weight_factorization_flag = weight_factorization
+        self.Dense_Layer = CustomDenseLayer if weight_factorization else nn.Linear
 
         # Fourier feature layer
         if self.use_fourier_features:
-            self.fourier_features = tf.keras.Sequential(name=f'fourier_layer')
-            self.fourier_features.add(tf.keras.layers.Dense(num_fourier_features, 
-                                                          activation=None, 
-                                                          use_bias=False,
-                                                          trainable=False, 
-                                                          kernel_initializer=tf.initializers.RandomNormal(stddev=self.fourier_sigma),
-                                                          name='fourier_features'))
-            self.fourier_features.add(SinCosLayer(name='fourier_sincos_layer'))
+            self.fourier_layer = nn.Linear(self.input_dim, num_fourier_features, bias=False)
+            nn.init.normal_(self.fourier_layer.weight, std=self.fourier_sigma)
+            self.fourier_layer.weight.requires_grad = False
         
 
         if self.architecture_Net in ('FCNN','MLP'):
@@ -147,165 +137,168 @@ class NeuralNet(tf.keras.Model):
             self.create_ResNet()
 
         # Output layer
-        self.out = self.Dense_Layer(output_dim,
-                               activation=None,
-                               name=f'output_layer')
-
-        # Scale output layer
-        if self.scale_output:
-            self.scale_out = tf.keras.layers.Lambda(
-                                lambda x: (x+1.0)/2.0 * (self.output_ub-self.output_lb)+self.output_lb, 
-                                name=f'scale_output_layer')
+        if self.weight_factorization_flag:
+            self.out = self.Dense_Layer(self.num_neurons_per_layer, output_dim, self.kernel_initializer)
+        else:
+            self.out = nn.Linear(self.num_neurons_per_layer, output_dim)
   
 
     def create_FCNN(self):
-        self.hidden_layers = list()
+        self.hidden_layers = nn.ModuleList()
+        in_dim = self.num_fourier_features * 2 if self.use_fourier_features else self.input_dim
         for i in range(self.num_hidden_layers):
-            layer = self.Dense_Layer(self.num_neurons_per_layer,
-                        activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                    activation=self.activation, 
-                                                    adaptive_activation=self.adaptive_activation),
-                        kernel_initializer=self.kernel_initializer,
-                        name=f'layer_{i}')
+            if self.weight_factorization_flag:
+                layer = self.Dense_Layer(in_dim if i == 0 else self.num_neurons_per_layer,
+                                        self.num_neurons_per_layer,
+                                        self.kernel_initializer)
+            else:
+                layer = self.Dense_Layer(in_dim if i == 0 else self.num_neurons_per_layer,
+                                        self.num_neurons_per_layer)
             self.hidden_layers.append(layer)
+        self.activation_fn = CustomActivation(self.num_neurons_per_layer, self.activation, self.adaptive_activation)
         self.call_architecture = self.call_FCNN
 
     def create_ModMLP(self):
         self.create_FCNN()
-        self.U = self.Dense_Layer(self.num_neurons_per_layer,
-                    activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                activation=self.activation, 
-                                                adaptive_activation=self.adaptive_activation),
-                    kernel_initializer=self.kernel_initializer,
-                    name=f'layer_u')
-        self.V = self.Dense_Layer(self.num_neurons_per_layer,
-                    activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                activation=self.activation, 
-                                                adaptive_activation=self.adaptive_activation),
-                    kernel_initializer=self.kernel_initializer,
-                    name=f'layer_v')
+        in_dim = self.num_fourier_features * 2 if self.use_fourier_features else self.input_dim
+        if self.weight_factorization_flag:
+            self.U = self.Dense_Layer(in_dim, self.num_neurons_per_layer, self.kernel_initializer)
+        else:
+            self.U = self.Dense_Layer(in_dim, self.num_neurons_per_layer)
+        if self.weight_factorization_flag:
+            self.V = self.Dense_Layer(in_dim, self.num_neurons_per_layer, self.kernel_initializer)
+        else:
+            self.V = self.Dense_Layer(in_dim, self.num_neurons_per_layer)
         self.call_architecture = self.call_ModMLP
 
 
     def create_ResNet(self):
-        self.first = self.Dense_Layer(self.num_neurons_per_layer,
-                        activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                    activation=self.activation, 
-                                                    adaptive_activation=self.adaptive_activation),
-                        kernel_initializer=self.kernel_initializer,
-                        name=f'layer_0')
-        self.hidden_blocks = list()
-        self.hidden_blocks_activations = list()
+        in_dim = self.num_fourier_features * 2 if self.use_fourier_features else self.input_dim
+        if self.weight_factorization_flag:
+            self.first = self.Dense_Layer(in_dim, self.num_neurons_per_layer, self.kernel_initializer)
+        else:
+            self.first = self.Dense_Layer(in_dim, self.num_neurons_per_layer)
+        self.first_activation = CustomActivation(self.num_neurons_per_layer, self.activation, self.adaptive_activation)
+        
+        self.hidden_blocks = nn.ModuleList()
+        self.hidden_blocks_activations = nn.ModuleList()
         for i in range(self.num_hidden_blocks):
-            block = tf.keras.Sequential(name=f"block_{i}")
-            block.add(self.Dense_Layer(self.num_neurons_per_layer,
-                            activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                        activation=self.activation,
-                                                        adaptive_activation=self.adaptive_activation),
-                            kernel_initializer=self.kernel_initializer))
-            block.add(self.Dense_Layer(self.num_neurons_per_layer,
-                            activation=None,
-                            kernel_initializer=self.kernel_initializer))
+            block = nn.ModuleList()
+            if self.weight_factorization_flag:
+                block.append(self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer, self.kernel_initializer))
+            else:
+                block.append(self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer))
+            block.append(CustomActivation(self.num_neurons_per_layer, self.activation, self.adaptive_activation))
+            if self.weight_factorization_flag:
+                block.append(self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer, self.kernel_initializer))
+            else:
+                block.append(self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer))
             self.hidden_blocks.append(block)
-            activation_layer = tf.keras.layers.Activation(activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                                                        activation=self.activation,
-                                                                                        adaptive_activation=self.adaptive_activation))
+            activation_layer = CustomActivation(self.num_neurons_per_layer, self.activation, self.adaptive_activation)
             self.hidden_blocks_activations.append(activation_layer)
         
-        self.last = self.Dense_Layer(self.num_neurons_per_layer,
-                        activation=CustomActivation(units=self.num_neurons_per_layer,
-                                                    activation=self.activation, 
-                                                    adaptive_activation=self.adaptive_activation),
-                        kernel_initializer=self.kernel_initializer,
-                        name=f'layer_1')
+        if self.weight_factorization_flag:
+            self.last = self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer, self.kernel_initializer)
+        else:
+            self.last = self.Dense_Layer(self.num_neurons_per_layer, self.num_neurons_per_layer)
+        self.last_activation = CustomActivation(self.num_neurons_per_layer, self.activation, self.adaptive_activation)
         self.call_architecture = self.call_ResNet
 
 
     def build_Net(self):
-        self.build(self.input_shape_N)
+        pass  # Not needed in PyTorch
 
-    def call(self, X):
+    def forward(self, X):
         if self.scale_input:
-            X = self.scale_in(X)
+            X = 2.0 * (X - self.input_lb) / (self.input_ub - self.input_lb) - 1.0
         if self.use_fourier_features:
-            X = self.fourier_features(X) 
+            X = self.fourier_layer(X)
+            X = torch.cat([torch.sin(2.0 * np.pi * X), torch.cos(2.0 * np.pi * X)], dim=-1)
         X = self.call_architecture(X)
         X = self.out(X)
         if self.scale_output:
-            X = self.scale_out(X)
+            X = (X + 1.0) / 2.0 * (self.output_ub - self.output_lb) + self.output_lb
         return X
 
     def call_FCNN(self, X):
         for layer in self.hidden_layers:
-            X = layer(X)
+            X = self.activation_fn(layer(X))
         return X
 
     def call_ModMLP(self, X):
-        U = self.U(X)
-        V = self.V(X)
+        U = self.activation_fn(self.U(X))
+        V = self.activation_fn(self.V(X))
         for layer in self.hidden_layers:
-            X = layer(X)*U + (1-layer(X))*V
+            out = self.activation_fn(layer(X))
+            X = out * U + (1 - out) * V
         return X
 
     def call_ResNet(self, X): 
-        X = self.first(X)
-        for block,activation in zip(self.hidden_blocks,self.hidden_blocks_activations):
-            X = activation(block(X) + X)
-        return self.last(X)
+        X = self.first_activation(self.first(X))
+        for block, activation in zip(self.hidden_blocks, self.hidden_blocks_activations):
+            residual = X
+            X = block[1](block[0](X))
+            X = block[2](X)
+            X = activation(X + residual)
+        return self.last_activation(self.last(X))
     
 
-class CustomActivation(tf.keras.layers.Layer):
+class CustomActivation(nn.Module):
 
     def __init__(self, units=1, activation='tanh', adaptive_activation=False, **kwargs):
-        super(CustomActivation, self).__init__(**kwargs)
+        super(CustomActivation, self).__init__()
         self.units = units
-        self.activation = activation
+        self.activation_name = activation
         self.adaptive_activation = adaptive_activation
+        
+        self.a = nn.Parameter(torch.ones(units), requires_grad=adaptive_activation)
+        
+        # Map activation names to PyTorch functions
+        activation_map = {
+            'tanh': torch.tanh,
+            'relu': torch.relu,
+            'sigmoid': torch.sigmoid,
+            'elu': torch.nn.functional.elu,
+            'softplus': torch.nn.functional.softplus,
+            'swish': lambda x: x * torch.sigmoid(x),
+            'gelu': torch.nn.functional.gelu
+        }
+        self.activation_func = activation_map.get(activation, torch.tanh)
 
-    def build(self, input_shape):
-        self.a = self.add_weight(name='a',
-                                shape=(self.units,),
-                                initializer='ones',
-                                trainable=self.adaptive_activation)
-
-    def call(self, inputs):
-        a_expanded = tf.expand_dims(self.a, axis=0) 
-        activation_func = tf.keras.activations.get(self.activation)
-        return activation_func(inputs * a_expanded)
+    def forward(self, inputs):
+        return self.activation_func(inputs * self.a.unsqueeze(0))
 
 
-class SinCosLayer(tf.keras.layers.Layer):
-    def call(self, Z):
-        return tf.concat([tf.sin(2.0*np.pi*Z), tf.cos(2.0*np.pi*Z)], axis=-1)
+class CustomDenseLayer(nn.Module):
 
-
-class CustomDenseLayer(tf.keras.layers.Layer):
-
-    def __init__(self, units, activation=None, kernel_initializer='glorot_normal', **kwargs):
-        super(CustomDenseLayer, self).__init__(**kwargs)
+    def __init__(self, input_dim, units, kernel_initializer='glorot_normal', **kwargs):
+        super(CustomDenseLayer, self).__init__()
+        self.input_dim = input_dim
         self.units = units
-        self.activation = activation
-        self.kernel_initializer= tf.keras.initializers.get(kernel_initializer)
-                                        
-    def build(self, input_shape):
-        self.input_dim = input_shape[-1]
-        W = tf.Variable(initial_value=self.kernel_initializer(shape=(input_shape[-1], self.units)),
-                trainable=False)
+        
+        # Initialize weights
+        if kernel_initializer == 'glorot_normal':
+            W = torch.empty(input_dim, units)
+            nn.init.xavier_normal_(W)
+        elif kernel_initializer == 'glorot_uniform':
+            W = torch.empty(input_dim, units)
+            nn.init.xavier_uniform_(W)
+        else:
+            W = torch.randn(input_dim, units) * 0.05
+        
         S, V = self.weight_factorization(W)
-        self.S = self.add_weight(name='S', shape=S.shape, initializer=tf.constant_initializer(S.numpy()), trainable=True)
-        self.V = self.add_weight(name='V', shape=V.shape, initializer=tf.constant_initializer(V.numpy()), trainable=True)
-        self.b = self.add_weight(name='b', shape=(self.units,), initializer='zeros', trainable=True)
+        self.S = nn.Parameter(S, requires_grad=True)
+        self.V = nn.Parameter(V, requires_grad=True)
+        self.b = nn.Parameter(torch.zeros(units), requires_grad=True)
 
     def weight_factorization(self, W, mean=1.0, stddev=0.1):
-        S = mean + tf.random.normal(shape=[tf.shape(W)[-1]], stddev=stddev)
-        S = tf.exp(S)
+        S = mean + torch.randn(W.shape[-1]) * stddev
+        S = torch.exp(S)
         V = W / S
-        return S,V
+        return S, V
 
-    def call(self, inputs):
-        SV = tf.multiply(self.S, self.V)
-        outputs = tf.matmul(inputs, SV) + self.b
-        if self.activation is not None:
-            outputs = self.activation(outputs)
+    def forward(self, inputs):
+        SV = self.S * self.V
+        outputs = torch.matmul(inputs, SV) + self.b
         return outputs
 

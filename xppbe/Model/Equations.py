@@ -1,5 +1,5 @@
 import numpy as np
-import tensorflow as tf
+import torch
 
 from .PDE_Model import PBE
 
@@ -20,17 +20,17 @@ class PBE_Direct(PBE):
 
     def get_phi(self,X,flag,model,value='phi'):
         if flag=='molecule':
-            phi = tf.reshape(model(X,flag)[:,0], (-1,1))
+            phi = model(X,flag)[:,0:1]
         elif flag=='solvent':
-            phi = tf.reshape(model(X,flag)[:,1], (-1,1))
+            phi = model(X,flag)[:,1:2]
         elif flag=='interface':
-            phi = (tf.reshape(model(X,flag)[:,0], (-1,1))+tf.reshape(model(X,flag)[:,1], (-1,1)))/2
+            phi = (model(X,flag)[:,0:1] + model(X,flag)[:,1:2])/2
 
         if value=='phi':
             return phi 
 
         if value == 'react':
-            G_val = tf.stop_gradient(self.G(X))
+            G_val = self.G(X).detach()
             phi_r = phi - G_val
 
         return phi_r
@@ -41,7 +41,7 @@ class PBE_Direct(PBE):
         du_1 = self.directional_gradient(self.mesh,model,x,nv,'molecule',value='phi')
         du_2 = self.directional_gradient(self.mesh,model,x,nv,'solvent',value='phi')
         if value=='react':
-            dG_dn = tf.stop_gradient(self.dG_n(X,Nv))
+            dG_dn = self.dG_n(X,Nv).detach()
             du_1 -= dG_dn
             du_2 -= dG_dn
         return du_1,du_2
@@ -68,17 +68,17 @@ class PBE_Reg_1(PBE):
 
     def get_phi(self,X,flag,model,value='phi'):
         if flag=='molecule':
-            phi_r = tf.reshape(model(X,flag)[:,0], (-1,1)) 
+            phi_r = model(X,flag)[:,0:1]
         elif flag=='solvent':
-            phi_r = tf.reshape(model(X,flag)[:,1], (-1,1))
+            phi_r = model(X,flag)[:,1:2]
         elif flag=='interface':
-            phi_r = (tf.reshape(model(X,flag)[:,0], (-1,1))+tf.reshape(model(X,flag)[:,1], (-1,1)))/2
+            phi_r = (model(X,flag)[:,0:1] + model(X,flag)[:,1:2])/2
         
         if value =='react':
             return phi_r
         
         if value == 'phi':
-            G_val = tf.stop_gradient(self.G(X))
+            G_val = self.G(X).detach()
             phi = phi_r + G_val
 
         return phi 
@@ -89,15 +89,21 @@ class PBE_Reg_1(PBE):
         du_1 = self.directional_gradient(self.mesh,model,x,nv,'molecule',value='react')
         du_2 = self.directional_gradient(self.mesh,model,x,nv,'solvent',value='react')
         if value=='phi':
-            dG_dn = tf.stop_gradient(self.dG_n(X,Nv))
+            dG_dn = self.dG_n(X,Nv).detach()
             du_1 += dG_dn
             du_2 += dG_dn
         return du_1,du_2
 
     def get_solvation_energy(self,model):
         X = self.x_qs
+        # Move X to same device as model
+        device = next(model.parameters()).device
+        if torch.is_tensor(X):
+            X = X.to(device)
+        else:
+            X = torch.from_numpy(X).float().to(device)
         phi_q = self.get_phi(X,'molecule',model,'react')
-        phi_q = phi_q.numpy().reshape(-1)
+        phi_q = phi_q.cpu().numpy().reshape(-1)
         G_solv = self.solvation_energy_phi_qs(phi_q)  
         return G_solv
 
@@ -117,18 +123,18 @@ class PBE_Reg_2(PBE):
 
     def get_phi(self,X,flag,model,value='phi'):
         if flag=='molecule':
-            phi_r = tf.reshape(model(X,flag)[:,0], (-1,1)) 
+            phi_r = model(X,flag)[:,0:1]
         elif flag=='solvent':
-            phi_r = tf.reshape(model(X,flag)[:,1], (-1,1)) - tf.stop_gradient(self.G(X))
+            phi_r = model(X,flag)[:,1:2] - self.G(X).detach()
         elif flag=='interface':
-            G_val = tf.stop_gradient(self.G(X))
-            phi_r = (tf.reshape(model(X,flag)[:,0], (-1,1))+tf.reshape(model(X,flag)[:,1], (-1,1))-G_val)/2
+            G_val = self.G(X).detach()
+            phi_r = (model(X,flag)[:,0:1] + model(X,flag)[:,1:2] - G_val)/2
 
         if value =='react':
             return phi_r
         
         if value == 'phi':
-            G_val = tf.stop_gradient(self.G(X))
+            G_val = self.G(X).detach()
             phi = phi_r + G_val
 
         return phi 
@@ -138,7 +144,7 @@ class PBE_Reg_2(PBE):
         nv = self.mesh.get_X(Nv)
         du_1 = self.directional_gradient(self.mesh,model,x,nv,'molecule',value='react')
         du_2 = self.directional_gradient(self.mesh,model,x,nv,'solvent',value='phi')
-        dG_dn = tf.stop_gradient(self.dG_n(X,Nv))
+        dG_dn = self.dG_n(X,Nv).detach()
         if value=='phi':
             du_1 += dG_dn
         elif value =='react':
@@ -147,8 +153,14 @@ class PBE_Reg_2(PBE):
     
     def get_solvation_energy(self,model):
         X = self.x_qs
+        # Move X to same device as model
+        device = next(model.parameters()).device
+        if torch.is_tensor(X):
+            X = X.to(device)
+        else:
+            X = torch.from_numpy(X).float().to(device)
         phi_q = self.get_phi(X,'molecule',model,'react')
-        phi_q = phi_q.numpy().reshape(-1)
+        phi_q = phi_q.cpu().numpy().reshape(-1)
         G_solv = self.solvation_energy_phi_qs(phi_q)  
         return G_solv
     
@@ -206,13 +218,13 @@ class PBE_Bound(PBE):
             phi = phi.reshape(-1,1)
             
         elif flag=='interface':
-            phi = tf.reshape(model(X,flag)[:,0]+model(X,flag)[:,1],(-1,1))/2
+            phi = (model(X,flag)[:,0:1] + model(X,flag)[:,1:2])/2
 
         if value=='phi':
             return phi 
 
         if value == 'react':
-            G_val = tf.stop_gradient(self.G(X))
+            G_val = self.G(X).detach()
             phi_r = phi - G_val
             
         return phi_r
@@ -222,7 +234,7 @@ class PBE_Bound(PBE):
         nv = self.mesh.get_X(Nv)
         du_1 = self.directional_gradient(self.mesh,model,x,nv,'interface',value='phi')
         if value=='react':
-            dG_dn = tf.stop_gradient(self.dG_n(X,Nv))
+            dG_dn = self.dG_n(X,Nv).detach()
             du_1 -= dG_dn
         return du_1,du_1*self.epsilon_1/self.epsilon_2
 
@@ -253,15 +265,19 @@ class Equations_utils():
         
         self.PBE = PBE
         self.field = field
+        torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
         for key, value in domain_properties.items():
             if key != 'molecule':
-                setattr(self, key, tf.constant(value, dtype=self.DTYPE))
+                if torch.is_tensor(value):
+                    setattr(self, key, value.clone().detach().to(torch_dtype))
+                else:
+                    setattr(self, key, torch.tensor(value, dtype=torch_dtype))
             else:
                 setattr(self, key, value)
 
     def residual_loss(self,mesh,model,X,SU,flag):
         r = self.get_r(mesh,model,X,SU,flag)     
-        Loss_r = tf.reduce_mean(tf.square(r))
+        Loss_r = torch.mean(r**2)
         return Loss_r
 
 
@@ -401,19 +417,20 @@ class Boundary_Poisson(Equations_utils):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args,**kwargs)
-        self.areas = tf.transpose(tf.constant(self.PBE.mesh.mol_faces_areas, dtype=self.DTYPE))
-        self.normals = tf.constant(self.PBE.mesh.mol_faces_normal, dtype=self.DTYPE)
-        self.centroids = tf.constant(self.PBE.mesh.mol_faces_centroid, dtype=self.DTYPE)
+        torch_dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        self.areas = torch.from_numpy(self.PBE.mesh.mol_faces_areas).to(torch_dtype).T
+        self.normals = torch.from_numpy(self.PBE.mesh.mol_faces_normal).to(torch_dtype)
+        self.centroids = torch.from_numpy(self.PBE.mesh.mol_faces_centroid).to(torch_dtype)
 
     def get_r(self,mesh,model,X,SU,flag):
         x,y,z = X
         R = mesh.stack_X(x,y,z)
         X_c = self.centroids
         N_v = self.normals
-        phi_i = tf.transpose(self.PBE.get_phi(X_c,flag,model,value=self.field))
-        dphi_i = tf.transpose(self.PBE.get_dphi(X_c,N_v,flag,model,value='phi')[0])
+        phi_i = self.PBE.get_phi(X_c,flag,model,value=self.field).T
+        dphi_i = self.PBE.get_dphi(X_c,N_v,flag,model,value='phi')[0].T
         integrand = (self.PBE.G_L(R,X_c)*dphi_i - self.PBE.dG_L(R,X_c,N_v)*phi_i)*self.areas
-        integral = tf.reduce_sum(integrand, axis=1, keepdims=True) 
+        integral = torch.sum(integrand, dim=1, keepdim=True)
         phi = self.PBE.get_phi(R,flag,model,value=self.field)
         r = 0.5*phi - self.PBE.G(R) - integral
         return r
@@ -423,19 +440,20 @@ class Boundary_Helmholtz(Equations_utils):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args,**kwargs)
-        self.areas = tf.transpose(tf.constant(self.PBE.mesh.mol_faces_areas, dtype=self.DTYPE))
-        self.normals = tf.constant(self.PBE.mesh.mol_faces_normal, dtype=self.DTYPE)
-        self.centroids = tf.constant(self.PBE.mesh.mol_faces_centroid, dtype=self.DTYPE)
+        dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        self.areas = torch.from_numpy(self.PBE.mesh.mol_faces_areas).to(dtype).T
+        self.normals = torch.from_numpy(self.PBE.mesh.mol_faces_normal).to(dtype)
+        self.centroids = torch.from_numpy(self.PBE.mesh.mol_faces_centroid).to(dtype)
 
     def get_r(self,mesh,model,X,SU,flag):
         x,y,z = X
         R = mesh.stack_X(x,y,z)
         X_c = self.centroids
         N_v = self.normals
-        phi_i = tf.transpose(self.PBE.get_phi(X_c,flag,model,value=self.field))
-        dphi_i = tf.transpose(self.PBE.get_dphi(X_c,N_v,flag,model,value='phi')[1])
+        phi_i = self.PBE.get_phi(X_c,flag,model,value=self.field).T
+        dphi_i = self.PBE.get_dphi(X_c,N_v,flag,model,value='phi')[1].T
         integrand = (- self.PBE.G_Y(R,X_c)*dphi_i + self.PBE.dG_Y(R,X_c,N_v)*phi_i)*self.areas
-        integral =  tf.reduce_sum(integrand, axis=1, keepdims=True) 
+        integral = torch.sum(integrand, dim=1, keepdim=True)
         phi = self.PBE.get_phi(R,flag,model,value=self.field)
         r = 0.5*phi - integral
         return r

@@ -1,6 +1,6 @@
 import os
 import numpy as np
-import tensorflow as tf
+import torch
 import trimesh
 import pygamer
 import logging
@@ -50,7 +50,8 @@ class Region_Mesh():
             dataset = self.random_points_in_elements(self.vertices,self.elements,4,self.percentage_vol_mesh)
         if self.type_m=='points':
             dataset = self.random_points_near_charges(self.charges[0],self.charges[1])
-        return tf.constant(dataset, dtype=self.DTYPE)
+        dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        return torch.from_numpy(dataset).to(dtype) if isinstance(dataset, np.ndarray) else dataset
     
     @staticmethod
     def random_points_in_elements(vertices, elements,num_vert_per_elem,percentage_mesh=1.0):
@@ -72,20 +73,21 @@ class Region_Mesh():
             if random_points is None:
                 random_points = X_in
             else:
-                random_points = tf.concat([random_points,X_in], axis=0)
+                random_points = torch.cat([random_points,X_in], dim=0)
         return random_points
 
     def generate_one_charge_dataset(self,x_q,r_q):            
-        x_q_tensor = tf.constant(x_q, dtype=self.DTYPE)
+        dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+        x_q_tensor = torch.tensor(x_q, dtype=dtype)
         sigma = self.G_sigma*3 if self.G_sigma<0.8*r_q else 0.8*r_q
-        r = sigma * tf.sqrt(tf.random.uniform(shape=(self.N_pq,), minval=0, maxval=1))
-        theta = tf.random.uniform(shape=(self.N_pq,), minval=0, maxval=2*np.pi)
-        phi = tf.random.uniform(shape=(self.N_pq,), minval=0, maxval=np.pi)
+        r = sigma * torch.sqrt(torch.rand(self.N_pq, dtype=dtype))
+        theta = torch.rand(self.N_pq, dtype=dtype) * 2 * np.pi
+        phi = torch.rand(self.N_pq, dtype=dtype) * np.pi
 
-        x_random = x_q[0] + r * tf.sin(phi) * tf.cos(theta)
-        y_random = x_q[1] + r * tf.sin(phi) * tf.sin(theta)
-        z_random = x_q[2] + r * tf.cos(phi)
-        X_in = tf.concat([tf.reshape(x_q_tensor,[1,3]), tf.stack([x_random, y_random, z_random], axis=-1)], axis=0)
+        x_random = x_q[0] + r * torch.sin(phi) * torch.cos(theta)
+        y_random = x_q[1] + r * torch.sin(phi) * torch.sin(theta)
+        z_random = x_q[2] + r * torch.cos(phi)
+        X_in = torch.cat([x_q_tensor.reshape(1,3), torch.stack([x_random, y_random, z_random], dim=-1)], dim=0)
 
         return X_in
 
@@ -299,7 +301,8 @@ class Domain_Mesh():
 
             if type_b[0] in ('R','D','K','N','P','Q'): 
                 if type_b in self.region_meshes:
-                    X = tf.constant(self.region_meshes[type_b].vertices, dtype=self.DTYPE)
+                    dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+                    X = torch.from_numpy(self.region_meshes[type_b].vertices).to(dtype)
                 else:
                     X = None
                 X,U = self.get_XU(X,bl)
@@ -314,16 +317,18 @@ class Domain_Mesh():
 
             elif type_b[0] == 'I':
                 N = self.mol_verts_normal
-                X = tf.constant(self.mol_verts, dtype=self.DTYPE)
+                dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+                X = torch.from_numpy(self.mol_verts).to(dtype)
                 X_I = (X, N)
                 self.domain_mesh_names.add(type_b)
                 self.domain_mesh_data['I'] = (X_I,flag)               
 
             elif type_b in ('G'):
                 self.domain_mesh_names.add(type_b)
-                self.domain_mesh_data[type_b] = ((tf.constant(self.mol_faces_centroid, dtype=self.DTYPE),
-                                                  tf.constant(self.mol_faces_normal, dtype=self.DTYPE),
-                                                  tf.constant(self.mol_faces_areas, dtype=self.DTYPE)
+                dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+                self.domain_mesh_data[type_b] = ((torch.from_numpy(self.mol_faces_centroid).to(dtype),
+                                                  torch.from_numpy(self.mol_faces_normal).to(dtype),
+                                                  torch.from_numpy(self.mol_faces_areas).to(dtype)
                                                   ),flag)
 
             elif type_b[0] in ('E'):
@@ -373,16 +378,17 @@ class Domain_Mesh():
                 exterior_distances = np.linalg.norm(exterior_points, axis=1)
                 exterior_points = exterior_points[exterior_distances <= self.R_exterior]
 
-                X_out = tf.constant(exterior_points, dtype=self.DTYPE)
+                dtype = torch.float32 if self.DTYPE == 'float32' else torch.float64
+                X_out = torch.from_numpy(exterior_points).to(dtype)
                 X_exp.append(X_out)
                 
                 j = 1
                 for q in q_list:
                     if q.atom_name in L_names:
                         if str(j) in L_phi:
-                            phi_ens = tf.constant(L_phi[str(j)] , dtype=self.DTYPE)
-                            xq = tf.reshape(tf.constant(q.x_q, dtype=self.DTYPE), (1,3))
-                            r_q = tf.constant(q.r_q, dtype=self.DTYPE)
+                            phi_ens = torch.tensor(L_phi[str(j)], dtype=dtype)
+                            xq = torch.from_numpy(q.x_q).to(dtype).reshape(1,3)
+                            r_q = torch.tensor(q.r_q, dtype=dtype)
                             X_exp_values.append(((xq,r_q),phi_ens))
                         j += 1
 
@@ -419,7 +425,7 @@ class Domain_Mesh():
         n = x.shape[0]
         mu, sigma = 1, 0.1
         s = np.array(np.random.default_rng().normal(mu, sigma, n), dtype='float32')
-        s = tf.reshape(s,[n,1])
+        s = torch.from_numpy(s).reshape(n,1)
         return s
 
     def read_file_data(self,file,domain):
@@ -438,28 +444,38 @@ class Domain_Mesh():
                     z_b.append(float(z))
                     phi_b.append(float(phi))
 
-        x_b = tf.constant(np.array(x_b, dtype=self.DTYPE)[:, None])
-        y_b = tf.constant(np.array(y_b, dtype=self.DTYPE)[:, None])
-        z_b = tf.constant(np.array(z_b, dtype=self.DTYPE)[:, None])
-        phi_b = tf.constant(np.array(phi_b, dtype=self.DTYPE)[:, None])/self.to_V
+        x_b = torch.from_numpy(np.array(x_b, dtype=self.DTYPE)[:, None])
+        y_b = torch.from_numpy(np.array(y_b, dtype=self.DTYPE)[:, None])
+        z_b = torch.from_numpy(np.array(z_b, dtype=self.DTYPE)[:, None])
+        phi_b = torch.from_numpy(np.array(phi_b, dtype=self.DTYPE)[:, None])/self.to_V
 
-        X = tf.concat([x_b, y_b, z_b], axis=1)
+        X = torch.cat([x_b, y_b, z_b], dim=1)
 
         return X,phi_b
 
 
     @staticmethod
     def get_X(X):
-        return tf.split(X, num_or_size_splits=X.shape[1], axis=1)
+        if not torch.is_tensor(X):
+            X = torch.from_numpy(X).float()
+        # Don't set requires_grad here - it will be set in laplacian/gradient functions
+        return torch.split(X, split_size_or_sections=1, dim=1)
 
     @staticmethod
     def stack_X(x,y,z):
-        return tf.stack([tf.squeeze(x, axis=1), tf.squeeze(y, axis=1), tf.squeeze(z, axis=1)], axis=1)
+        if not torch.is_tensor(x):
+            x = torch.from_numpy(x).float()
+        if not torch.is_tensor(y):
+            y = torch.from_numpy(y).float()
+        if not torch.is_tensor(z):
+            z = torch.from_numpy(z).float()
+        return torch.stack([x.squeeze(dim=1), y.squeeze(dim=1), z.squeeze(dim=1)], dim=1)
     
     @classmethod
     def value_u_b(cls,x, y, z, value):
         n = x.shape[0]
-        return tf.ones((n,1), dtype=cls.DTYPE)*value
+        torch_dtype = torch.float32 if cls.DTYPE == 'float32' else torch.float64
+        return torch.ones((n,1), dtype=torch_dtype)*value
 
     def save_data_plot(self,X_plot):
         path_files = os.path.join(self.results_path,'mesh')

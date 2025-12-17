@@ -90,10 +90,17 @@ lr:
     staircase: true
 
 optimizer2: L-BFGS-B
+options_optimizer2:
+    maxiter: 100
+    maxfun: 100
+    maxcor: 50
+    maxls: 50
+    ftol: 0.0000000000002
+    gtol: 0.00000000001
     
 # Solve parameters
 N_iters: 1000
-N_steps_2: 0
+N_steps_2: 100
 
 
 iters_save_model: 0
