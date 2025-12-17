@@ -77,8 +77,8 @@ class PINN(PINN_utils):
             optimizer_lbfgs = torch.optim.LBFGS(
                 self.model.parameters(),
                 max_iter=self.optimizer_2_opts['maxiter'],
-                max_eval=self.optimizer_2_opts.get('maxfun', None),
-                tolerance_grad=self.optimizer_2_opts.get('gtol', 1e-5),
+                max_eval=self.optimizer_2_opts['maxfun'], 
+                tolerance_grad=self.optimizer_2_opts['gtol'],
                 tolerance_change=self.optimizer_2_opts['ftol'],
                 history_size=self.optimizer_2_opts['maxcor'],
                 line_search_fn='strong_wolfe'
